@@ -349,3 +349,98 @@ def test_record_one_directly(tmp_path):
     path = ctrl.record_one("coffee")
     assert path.exists()
     assert ctrl.dataset_counts().get("coffee", 0) >= 1
+
+
+class _FakeRealSource:
+    """A write-capable, non-streaming source standing in for a real serial link."""
+
+    def __init__(self):
+        self.cmds = []
+
+    def frames(self):
+        return iter(())
+
+    def close(self):
+        pass
+
+    def write_command(self, text):
+        self.cmds.append(text.strip())
+        return True
+
+
+def test_servo_driven_on_phase_transitions(tmp_path):
+    cfg = _fast_config()  # servo_enabled True via default_config (0 / 105)
+    ctrl = SniffController(
+        cfg, out_dir=tmp_path, use_sim=False, port="x",
+        model_path=str(tmp_path / "m.joblib"),
+    )
+    src = _FakeRealSource()
+    app = SniffApp(ctrl, source_factory=lambda c: src, paced=False)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            names = cfg.sensor_names()
+            app._engine.arm_capture("coffee", save=True)
+            app._active_label = app._rep_label = "coffee"
+            app._rep_total = app._reps_remaining = 1
+            sim = ContinuousSim(cfg, seed=0, noise_counts=0.0)
+            sim.begin_odor("coffee")
+            for _ in range(app._engine.n):
+                app._on_engine_event(app._engine.step(sim.read()), names)
+            assert src.cmds[0] == "S0"     # start / baseline -> fresh air (0°)
+            assert "S105" in src.cmds      # exposure -> sample (105°)
+            assert src.cmds[-1] == "S0"    # purge -> fresh air (0°)
+
+    asyncio.run(scenario())
+
+
+def test_sim_does_not_drive_a_servo(tmp_path):
+    # in sim mode there is no serial write; servo commands must not be attempted
+    ctrl, app = _app(tmp_path, label="coffee")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            names = app.controller.config.sensor_names()
+            # a silent source has no write_command; driving frames must not error
+            sim = ContinuousSim(app.controller.config, seed=0, noise_counts=0.0)
+            app._engine.arm_capture("coffee")
+            sim.begin_odor("coffee")
+            for _ in range(app._engine.n):
+                app._on_engine_event(app._engine.step(sim.read()), names)
+            # nothing to assert about a servo; the point is no crash + a sniff saved
+            assert app.controller.dataset_counts().get("coffee", 0) == 1
+
+    asyncio.run(scenario())
+
+
+def test_auto_reps_gated_on_recovery(tmp_path):
+    cfg = _fast_config()
+    ctrl, app = _app(tmp_path, reps=2, label="coffee")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            names = cfg.sensor_names()
+            # start a 2-rep sequence (mimic action_record without source coupling)
+            app._rep_label = "coffee"
+            app._rep_total = app._reps_remaining = 2
+            app._engine.arm_capture("coffee", save=True)
+            app._active_label = "coffee"
+            sim = ContinuousSim(cfg, seed=0, noise_counts=0.0)
+            sim.begin_odor("coffee")
+            for _ in range(app._engine.n):  # rep 1
+                app._on_engine_event(app._engine.step(sim.read()), names)
+            assert app._reps_remaining == 1
+            assert app._await_recovery is True
+            # idle (clean) frames -> recovery fires -> auto-arms rep 2
+            for _ in range(500):
+                app._on_engine_event(app._engine.step(sim.read()), names)
+                if not app._await_recovery:
+                    break
+            assert app._await_recovery is False   # recovery gated the next rep
+            app._on_engine_event(app._engine.step(sim.read()), names)
+            assert app._engine.capturing is True  # rep 2 started hands-free
+
+    asyncio.run(scenario())

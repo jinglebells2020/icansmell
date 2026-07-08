@@ -31,3 +31,9 @@ ema_alphas = [0.1, 0.01, 0.001]
 [baseline]
 max_cv = 0.05      # reject baseline if any channel CV exceeds this
 recover_tol = 0.02 # ±2% of R0 to count as recovered
+
+[servo]
+enabled = true         # drive the airflow servo automatically during a capture
+pin = 12               # servo signal pin (documented in firmware; host just sends S<angle>)
+fresh_air_angle = 0    # substance closed / fresh-air straw open (baseline & purge)
+sample_angle = 105     # substance open / fresh-air closed (exposure)

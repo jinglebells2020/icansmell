@@ -108,6 +108,12 @@ class SniffApp(App):
         self._identify_pending = False
         self._active_label = None
         self._model = None              # cached loaded SmellModel (invalidated on fit)
+        # recovery-gated auto-reps: `r` records `reps` sniffs, each after recovery
+        self._rep_label = None
+        self._reps_remaining = 0
+        self._rep_total = 0
+        self._await_recovery = False
+        self._servo_started = False     # sent the initial fresh-air command yet?
         # test hooks: inject a bounded frame source + disable real-time pacing
         self._source_factory = source_factory
         self._paced = paced
@@ -202,7 +208,9 @@ class SniffApp(App):
         if ctrl.use_sim:
             from ..monitor import ContinuousSim
 
-            return ContinuousSim(cfg, seed=ctrl.seed)
+            # noise-free so the recovery teller (±2%) settles cleanly for the demo;
+            # values still move during a sniff. Real hardware has its own noise.
+            return ContinuousSim(cfg, seed=ctrl.seed, noise_counts=0.0)
         from ..serialio import SerialReader
 
         return SerialReader(
@@ -214,6 +222,7 @@ class SniffApp(App):
         from ..record import SniffRecorder
 
         self._monitor_stop = False
+        self._servo_started = False
         self._engine = MonitorEngine(
             self.controller.config, SniffRecorder(self.controller.config, self.controller.out_dir)
         )
@@ -248,6 +257,7 @@ class SniffApp(App):
         phase = ev["phase"]
         self.query_one("#sensors", SensorBars).update_values(names, ev["rs"], phase)
         self._set_nose("sniffing" if phase == "exposure" else "idle")
+        self._drive_servo(ev)
 
         if ev["capture"] is not None:
             k, n = ev["capture"]
@@ -262,12 +272,39 @@ class SniffApp(App):
             if rec["recovered"]:
                 if rec["just_recovered"]:
                     self._status("✓ sensors recovered — ready for the next sniff")
+                    if self._await_recovery:
+                        self._await_recovery = False
+                        self._arm_next_rep()  # next rep in the sequence, hands-free
             else:
                 wc = names[rec["worst_channel"]] if rec["worst_channel"] >= 0 else "?"
                 self._status(
                     f"… recovering — {rec['max_dev'] * 100:.1f}% off ({wc}), "
                     f"held {rec['held_s']:.1f}/{rec['target_s']:.0f}s"
                 )
+
+    def _drive_servo(self, ev: dict) -> None:
+        """On real hardware, switch the airflow servo to match the phase.
+
+        First frame → fresh-air (clean air over sensors); exposure → sample angle;
+        baseline/purge/monitor → fresh-air. No-op in sim or without a write-capable
+        source or with the servo disabled.
+        """
+        cfg = self.controller.config
+        if self.controller.use_sim or not cfg.servo_enabled:
+            return
+        src = self._source
+        if not hasattr(src, "write_command"):
+            return
+        if not self._servo_started:
+            src.write_command(f"S{cfg.servo_fresh_air_angle}")
+            self._servo_started = True
+        if ev["phase_changed"]:
+            angle = (
+                cfg.servo_sample_angle
+                if ev["phase"] == "exposure"
+                else cfg.servo_fresh_air_angle
+            )
+            src.write_command(f"S{angle}")
 
     def _on_capture_complete(self, saved) -> None:
         result, path = saved
@@ -285,7 +322,13 @@ class SniffApp(App):
                     f"novelty {verdict['novelty']:.3f} is_novel {verdict['is_novel']}"
                 )
         elif path is not None:
-            self._log(f"saved {path.name}")
+            self._reps_remaining -= 1
+            done = self._rep_total - self._reps_remaining
+            if self._reps_remaining > 0:
+                self._await_recovery = True  # gate the next rep on recovery
+                self._log(f"saved {path.name} ({done}/{self._rep_total}) — recovering…")
+            else:
+                self._log(f"saved {path.name} ({done}/{self._rep_total}) — done")
         self._active_label = None
         self._refresh_all()
 
@@ -379,21 +422,32 @@ class SniffApp(App):
     # ---------------------------------------------------------- record
     def action_record(self) -> None:
         self._disarm_clear()
-        if self._engine is None:
+        if self._engine is None or self._engine.capturing or self._await_recovery:
+            self._log("busy — a capture sequence is already running")
             return
-        if self._engine.capturing:
-            self._log("busy — a sniff is already being captured")
-            return
-        if self._engine.arm_capture(self.label, save=True):
-            self._active_label = self.label
-            self._log(f"recording '{self.label}' — follow the phase cues")
+        self._rep_label = self.label
+        self._rep_total = max(1, self.reps)
+        self._reps_remaining = self._rep_total
+        if self._rep_total > 1:
+            self._log(
+                f"recording {self._rep_total}× '{self.label}' — auto, recovery-gated"
+            )
+        self._arm_next_rep()
+
+    def _arm_next_rep(self) -> None:
+        """Arm the next sniff in the current record sequence (UI thread)."""
+        label = self._rep_label
+        if self._engine.arm_capture(label, save=True):
+            self._active_label = label
+            idx = self._rep_total - self._reps_remaining + 1
+            self._log(f"recording '{label}' {idx}/{self._rep_total} — follow the cues")
             if self.controller.use_sim and hasattr(self._source, "begin_odor"):
-                self._source.begin_odor(self.label)
+                self._source.begin_odor(label)
 
     # -------------------------------------------------------- identify
     def action_identify(self) -> None:
         self._disarm_clear()
-        if self._engine is None or self._engine.capturing:
+        if self._engine is None or self._engine.capturing or self._await_recovery:
             return
         if not self.controller.has_model():
             self._log("identify: no model yet — press f to fit first")

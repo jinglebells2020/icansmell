@@ -42,6 +42,13 @@ class Config:
     ema_alphas: tuple[float, ...]
     max_cv: float
     recover_tol: float
+    # Airflow servo (optional): switches the fresh-air vs sample straw during a
+    # capture. Angles are found via `sniffsniff servo`. Disabled by default so a
+    # rig without a servo is unaffected.
+    servo_enabled: bool = False
+    servo_pin: int = 12
+    servo_fresh_air_angle: int = 0
+    servo_sample_angle: int = 105
 
     def rl_array(self) -> np.ndarray:
         """Per-channel load resistances, shape ``(N,)`` float64, ordered by ch."""
@@ -88,6 +95,7 @@ def _config_from_dict(data: dict) -> Config:
     baseline = data["baseline"]
 
     channels = _build_channels(list(array["channels"]))
+    servo = data.get("servo", {})
 
     return Config(
         bits=int(board["bits"]),
@@ -102,6 +110,10 @@ def _config_from_dict(data: dict) -> Config:
         ema_alphas=tuple(float(a) for a in features["ema_alphas"]),
         max_cv=float(baseline["max_cv"]),
         recover_tol=float(baseline["recover_tol"]),
+        servo_enabled=bool(servo.get("enabled", False)),
+        servo_pin=int(servo.get("pin", 12)),
+        servo_fresh_air_angle=int(servo.get("fresh_air_angle", 0)),
+        servo_sample_angle=int(servo.get("sample_angle", 105)),
     )
 
 
@@ -136,4 +148,8 @@ def default_config() -> Config:
         ema_alphas=(0.1, 0.01, 0.001),
         max_cv=0.05,
         recover_tol=0.02,
+        servo_enabled=True,
+        servo_pin=12,
+        servo_fresh_air_angle=0,
+        servo_sample_angle=105,
     )

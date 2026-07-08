@@ -183,6 +183,28 @@ class SerialReader:
                 pass
             self._serial = None
 
+    def write_command(self, text: str) -> bool:
+        """Write a command line to the open port (host→device, e.g. ``"S105"``).
+
+        Best-effort and non-fatal: appends a newline if missing, returns True on a
+        successful write, False if the port isn't open yet or the write hiccups —
+        so a servo command never crashes the read loop. Call from the same thread
+        that iterates :meth:`frames` (the two share one serial handle).
+        """
+        ser = self._serial
+        if ser is None:
+            return False
+        line = text if text.endswith("\n") else text + "\n"
+        try:
+            ser.write(line.encode("ascii"))
+            try:
+                ser.flush()
+            except Exception:  # pragma: no cover - flush best-effort
+                pass
+            return True
+        except Exception:  # pragma: no cover - write hiccup, don't crash the loop
+            return False
+
     def close(self) -> None:
         """Close the underlying stream if one was opened; safe to call anytime."""
         self._close_serial()

@@ -215,3 +215,43 @@ channels = [
 def test_load_config_missing_file_raises(tmp_path):
     with pytest.raises((FileNotFoundError, OSError)):
         load_config(tmp_path / "does_not_exist.toml")
+
+
+# --- servo config ------------------------------------------------------------
+
+def test_default_config_has_servo():
+    c = default_config()
+    assert c.servo_enabled is True
+    assert c.servo_pin == 12
+    assert c.servo_fresh_air_angle == 0
+    assert c.servo_sample_angle == 105
+
+
+def test_load_config_servo_defaults_when_section_missing(tmp_path):
+    # a config with no [servo] section falls back to disabled defaults
+    toml = tmp_path / "no_servo.toml"
+    toml.write_text(
+        """
+[board]
+bits = 10
+vref = 5.0
+[array]
+vcc = 5.0
+channels = [ {ch=0,sensor="MQ3",rl=1000}, {ch=1,sensor="MQ135",rl=1000} ]
+[timing]
+scan_hz=20
+baseline_s=15
+exposure_s=45
+purge_s=90
+plateau_s=10
+[features]
+ema_alphas=[0.1,0.01,0.001]
+[baseline]
+max_cv=0.05
+recover_tol=0.02
+"""
+    )
+    c = load_config(toml)
+    assert c.servo_enabled is False        # absent section -> disabled
+    assert c.servo_fresh_air_angle == 0
+    assert c.servo_sample_angle == 105

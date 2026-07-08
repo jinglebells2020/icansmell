@@ -65,7 +65,7 @@
 const int NCH = 6;          // number of analog channels scanned: C0..C5
 const int N_SAMPLES = 16;   // ADC reads averaged per channel (after 1 discard)
 const int SERVO_PIN = 12;   // airflow servo signal pin
-const int SERVO_BOOT_ANGLE = 90;  // neutral start; real angles come from the host
+const int SERVO_BOOT_ANGLE = 0;   // boot into the fresh-air position (clean air over sensors)
 
 // Direct analog inputs, in channel order C0..C5 (see wiring map above).
 const int PINS[NCH] = {A0, A1, A2, A3, A4, A5};

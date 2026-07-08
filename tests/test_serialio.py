@@ -304,3 +304,32 @@ def test_serial_reader_startup_delay_waits_after_open(monkeypatch):
     frames = list(reader.frames())
     assert 2.5 in slept                       # waited for the board to boot
     assert frames and frames[0][0] == 1       # then read normally
+
+
+class _WSerial:
+    def __init__(self):
+        self.written = b""
+
+    def write(self, data):
+        self.written += data
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_write_command_before_open_returns_false():
+    r = SerialReader("x", opener=lambda: _WSerial())
+    assert r.write_command("S90") is False  # port not opened yet
+
+
+def test_write_command_writes_when_open():
+    fake = _WSerial()
+    r = SerialReader("x", opener=lambda: fake)
+    r._serial = fake  # simulate an open handle (as during frames())
+    assert r.write_command("S105") is True
+    assert r.write_command("S0\n") is True  # already-newline'd not doubled
+    assert fake.written == b"S105\nS0\n"
