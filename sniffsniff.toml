@@ -1,0 +1,32 @@
+# sniffsniff configuration — 6-sensor MQ array (Foundation milestone)
+# The number of channel entries below defines N. Confirm/measure RL per module.
+
+[board]
+bits = 10          # Uno ADC resolution (10-bit → counts 0..1023)
+vref = 5.0         # Uno ADC reference volts
+
+[array]
+vcc = 5.0          # sensor supply volts
+# one entry per mux channel C0..C5 — CONFIRM RL against your actual modules
+channels = [
+  { ch = 0, sensor = "MQ2",   rl = 1000 },
+  { ch = 1, sensor = "MQ3",   rl = 1000 },
+  { ch = 2, sensor = "MQ4",   rl = 1000 },
+  { ch = 3, sensor = "MQ7",   rl = 1000 },
+  { ch = 4, sensor = "MQ8",   rl = 1000 },
+  { ch = 5, sensor = "MQ135", rl = 1000 },
+]
+
+[timing]
+scan_hz     = 20
+baseline_s  = 15
+exposure_s  = 45
+purge_s     = 90
+plateau_s   = 10   # trailing exposure window for plateau_mean
+
+[features]
+ema_alphas = [0.1, 0.01, 0.001]
+
+[baseline]
+max_cv = 0.05      # reject baseline if any channel CV exceeds this
+recover_tol = 0.02 # ±2% of R0 to count as recovered
