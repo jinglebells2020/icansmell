@@ -12,9 +12,74 @@ status dict the CLI/TUI can render.
 """
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 
-__all__ = ["RecoveryMonitor"]
+__all__ = ["RecoveryMonitor", "StabilityMonitor"]
+
+
+class StabilityMonitor:
+    """Self-referential "sensors are at rest" detector for the pre-baseline settle.
+
+    Unlike :class:`RecoveryMonitor` (which asks *did Rs return to a prior R0?*), this
+    asks *is Rs flat right now?* — every channel stays within ``±tol`` of the recent
+    rolling-window mean for the whole ``hold_s`` window. That's the right gate before
+    measuring a fresh R0 (it needs no prior baseline, so it works for the first sniff).
+
+    A ``max_wait_s`` cap makes it fall through (``timed_out``) rather than wait forever
+    on a sensor that never fully settles — the capture still proceeds, just flagged.
+
+    Parameters
+    ----------
+    tol:
+        Fractional flatness tolerance (e.g. ``0.02`` = within ±2% of the window mean).
+    scan_hz:
+        Frame rate, to size the hold window and the timeout in frames.
+    hold_s:
+        The signal must be flat across a window this long (default 3 s).
+    max_wait_s:
+        Give up waiting after this long (``None`` = wait indefinitely).
+    """
+
+    def __init__(self, tol: float, scan_hz: int, hold_s: float = 3.0, max_wait_s=30.0):
+        self.tol = float(tol)
+        self.scan_hz = int(scan_hz)
+        self.hold_s = float(hold_s)
+        self.win = max(1, round(hold_s * scan_hz))
+        self.max_wait = None if max_wait_s is None else max(1, round(max_wait_s * scan_hz))
+        self._buf: deque = deque(maxlen=self.win)
+        self._count = 0
+
+    def update(self, rs) -> dict:
+        """Feed one live ``Rs`` vector; return a status dict.
+
+        Keys: ``stable`` (window is flat), ``settled`` (stable OR timed out — the
+        engine may proceed), ``max_dev`` (largest deviation across the window, or None
+        until the window fills), ``waited_s``, and ``timed_out``.
+        """
+        self._count += 1
+        self._buf.append(np.asarray(rs, dtype=np.float64))
+
+        stable = False
+        max_dev = None
+        if len(self._buf) >= self.win:
+            arr = np.array(self._buf)              # (win, N)
+            mean = arr.mean(axis=0)
+            dev = np.abs(arr / mean - 1.0)         # per-frame, per-channel deviation
+            finite = np.isfinite(dev)
+            if finite.any():
+                max_dev = float(dev[finite].max())
+                stable = bool(np.all(dev[finite] <= self.tol))
+
+        timed_out = self.max_wait is not None and self._count >= self.max_wait
+        return {
+            "stable": stable,
+            "settled": bool(stable or timed_out),
+            "max_dev": max_dev,
+            "waited_s": self._count / self.scan_hz,
+            "timed_out": bool(timed_out and not stable),
+        }
 
 
 class RecoveryMonitor:

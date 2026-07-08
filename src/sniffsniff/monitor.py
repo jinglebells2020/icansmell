@@ -23,7 +23,7 @@ import numpy as np
 from . import calibrate
 from .capture import phase_of, session_frame_count
 from .record import SniffRecorder, phase_slices
-from .recovery import RecoveryMonitor
+from .recovery import RecoveryMonitor, StabilityMonitor
 from .simulator import Simulator
 
 __all__ = ["MonitorEngine", "ContinuousSim"]
@@ -50,16 +50,28 @@ class MonitorEngine:
         Recovery hold window (seconds) passed to :class:`RecoveryMonitor`.
     """
 
-    def __init__(self, config, recorder: SniffRecorder, *, hold_s: float = 5.0):
+    def __init__(
+        self,
+        config,
+        recorder: SniffRecorder,
+        *,
+        hold_s: float = 5.0,
+        settle_hold_s: float = 3.0,
+        settle_max_wait_s: float = 30.0,
+    ):
         self.config = config
         self.recorder = recorder
         self.hold_s = hold_s
+        self.settle_hold_s = settle_hold_s
+        self.settle_max_wait_s = settle_max_wait_s
         self.n = session_frame_count(config)
         self._slices = phase_slices(self.n, config)
 
         self._pending_label: str | None = None
         self._pending_save = True
         self._save = True
+        self._settling = False
+        self._stability: StabilityMonitor | None = None
         self._capturing = False
         self._label: str | None = None
         self._buf: list = []
@@ -70,16 +82,22 @@ class MonitorEngine:
     # -------------------------------------------------------- control
     @property
     def capturing(self) -> bool:
+        """True while actively windowing a sniff (baseline/exposure/purge)."""
         return self._capturing
 
+    @property
+    def busy(self) -> bool:
+        """True while settling, armed, or capturing — anything but idle monitoring."""
+        return self._settling or self._capturing or self._pending_label is not None
+
     def arm_capture(self, label: str, *, save: bool = True) -> bool:
-        """Request a capture of ``label`` (begins on the next :meth:`step`).
+        """Request a capture of ``label`` (settles, then begins on a later :meth:`step`).
 
         ``save=True`` persists the sniff to the dataset (a *record*); ``save=False``
         processes it but does not write it (an *identify*). Ignored (returns False)
-        if a capture is already running or armed.
+        if a capture is already settling, armed, or running.
         """
-        if self._capturing or self._pending_label is not None:
+        if self.busy:
             return False
         self._pending_label = label
         self._pending_save = bool(save)
@@ -106,18 +124,38 @@ class MonitorEngine:
             "capture": None,
             "saved": None,
             "recovery": None,
+            "settle": None,
         }
 
-        # Promote a pending request to an active capture at frame boundary.
-        if not self._capturing and self._pending_label is not None:
-            self._capturing = True
+        # Promote a pending request into the SETTLE phase (wait for a stable baseline
+        # before we measure R0 — not a blind fixed wait).
+        if not self._capturing and not self._settling and self._pending_label is not None:
+            self._settling = True
             self._label = self._pending_label
             self._save = self._pending_save
             self._pending_label = None
-            self._buf = []
-            self._i = 0
             self._phase = None
             self._recovery = None  # a new sniff supersedes the old recovery track
+            self._stability = StabilityMonitor(
+                self.config.recover_tol, self.config.scan_hz,
+                hold_s=self.settle_hold_s, max_wait_s=self.settle_max_wait_s,
+            )
+
+        if self._settling:
+            st = self._stability.update(rs)
+            event["phase"] = "settle"
+            event["settle"] = st
+            if self._phase != "settle":
+                event["phase_changed"] = True
+                self._phase = "settle"
+            if st["settled"]:
+                # sensors are at rest — begin the timed capture on the next frame
+                self._settling = False
+                self._capturing = True
+                self._buf = []
+                self._i = 0
+                self._phase = None
+            return event
 
         if self._capturing:
             self._buf.append(frame)

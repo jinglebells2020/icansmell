@@ -45,33 +45,59 @@ def test_continuous_sim_begin_odor_then_reverts():
 
 # --- MonitorEngine -----------------------------------------------------------
 
+def _engine(cfg, tmp_path):
+    # small, deterministic settle so tests are fast (noise-free sim settles cleanly)
+    return MonitorEngine(
+        cfg, SniffRecorder(cfg, tmp_path), settle_hold_s=0.25, settle_max_wait_s=2.0
+    )
+
+
+def _settle(eng, sim):
+    """Feed clean frames until the engine leaves SETTLE and starts capturing."""
+    for _ in range(2000):
+        eng.step(sim.read())
+        if eng.capturing:
+            return
+    raise AssertionError("engine never settled")
+
+
 def test_idle_frames_are_monitor_only(tmp_path):
     cfg = _cfg()
-    eng = MonitorEngine(cfg, SniffRecorder(cfg, tmp_path))
-    sim = ContinuousSim(cfg, seed=0)
+    eng = _engine(cfg, tmp_path)
+    sim = ContinuousSim(cfg, seed=0, noise_counts=0.0)
     for _ in range(5):
         ev = eng.step(sim.read())
         assert ev["phase"] == "monitor"
-        assert ev["saved"] is None
-        assert ev["recovery"] is None
+        assert ev["saved"] is None and ev["recovery"] is None
         assert ev["rs"].shape == (6,)
+
+
+def test_arm_settles_before_capturing(tmp_path):
+    cfg = _cfg()
+    eng = _engine(cfg, tmp_path)
+    sim = ContinuousSim(cfg, seed=0, noise_counts=0.0)
+    assert eng.arm_capture("coffee") is True
+    assert eng.arm_capture("coffee") is False  # busy (settling/armed) — refused
+    ev = eng.step(sim.read())
+    assert ev["phase"] == "settle"          # SETTLE first, not baseline
+    assert ev["settle"] is not None
+    assert eng.capturing is False           # not yet windowing a sniff
 
 
 def test_capture_windows_the_stream_and_saves(tmp_path):
     cfg = _cfg()
-    eng = MonitorEngine(cfg, SniffRecorder(cfg, tmp_path))
-    sim = ContinuousSim(cfg, seed=1)
-    n = eng.n
+    eng = _engine(cfg, tmp_path)
+    sim = ContinuousSim(cfg, seed=1, noise_counts=0.0)
 
-    assert eng.arm_capture("coffee") is True
-    assert eng.arm_capture("coffee") is False  # already armed — refused
+    eng.arm_capture("coffee")
+    _settle(eng, sim)                        # wait for a stable baseline first
     sim.begin_odor("coffee", seed=1)
 
     phases, saved = set(), None
-    for _ in range(n):
+    for _ in range(eng.n):
         ev = eng.step(sim.read())
         phases.add(ev["phase"])
-        assert ev["capture"] is not None  # progress reported throughout
+        assert ev["capture"] is not None
         if ev["saved"] is not None:
             saved = ev["saved"]
     assert phases == {"baseline", "exposure", "purge"}
@@ -79,18 +105,18 @@ def test_capture_windows_the_stream_and_saves(tmp_path):
     result, path = saved
     assert path.exists()
     assert result.features.shape[0] == 48
-    assert eng.capturing is False  # capture finished
+    assert eng.capturing is False
 
 
 def test_recovery_tracked_after_a_sniff(tmp_path):
     cfg = _cfg()
-    eng = MonitorEngine(cfg, SniffRecorder(cfg, tmp_path))
-    sim = ContinuousSim(cfg, seed=2)
+    eng = _engine(cfg, tmp_path)
+    sim = ContinuousSim(cfg, seed=2, noise_counts=0.0)
     eng.arm_capture("coffee")
+    _settle(eng, sim)
     sim.begin_odor("coffee", seed=2)
     for _ in range(eng.n):
         eng.step(sim.read())  # run the capture to completion
-    # subsequent idle frames now carry a recovery status
     ev = eng.step(sim.read())
     assert ev["recovery"] is not None
     assert set(ev["recovery"]) >= {"within_tol", "held_s", "target_s", "recovered"}
@@ -98,20 +124,24 @@ def test_recovery_tracked_after_a_sniff(tmp_path):
 
 def test_phase_changed_fires_on_transitions(tmp_path):
     cfg = _cfg()
-    eng = MonitorEngine(cfg, SniffRecorder(cfg, tmp_path))
-    sim = ContinuousSim(cfg, seed=0)
+    eng = _engine(cfg, tmp_path)
+    sim = ContinuousSim(cfg, seed=0, noise_counts=0.0)
     eng.arm_capture("coffee")
+    _settle(eng, sim)  # SETTLE happens before the timed phases
     sim.begin_odor("coffee")
-    changes = [ev["phase"] for _ in range(eng.n) if (ev := eng.step(sim.read()))["phase_changed"]]
-    assert changes == ["baseline", "exposure", "purge"]  # exactly one change per phase
+    changes = [
+        ev["phase"] for _ in range(eng.n) if (ev := eng.step(sim.read()))["phase_changed"]
+    ]
+    assert changes == ["baseline", "exposure", "purge"]  # one change per timed phase
 
 
 def test_capture_without_save_does_not_write(tmp_path):
     # identify path: process (features + R0 for recovery) but don't persist a sniff.
     cfg = _cfg()
-    eng = MonitorEngine(cfg, SniffRecorder(cfg, tmp_path))
-    sim = ContinuousSim(cfg, seed=3)
+    eng = _engine(cfg, tmp_path)
+    sim = ContinuousSim(cfg, seed=3, noise_counts=0.0)
     eng.arm_capture("?", save=False)
+    _settle(eng, sim)
     sim.begin_odor("coffee", seed=3)
     saved = None
     for _ in range(eng.n):

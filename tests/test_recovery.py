@@ -83,3 +83,49 @@ def test_all_channels_open_is_not_recovered():
     st = mon.update(np.array([np.inf, np.inf, np.inf]))  # nothing finite
     assert st["within_tol"] is False
     assert st["recovered"] is False
+
+
+# --- StabilityMonitor (pre-baseline settle gate) -----------------------------
+
+from sniffsniff.recovery import StabilityMonitor
+
+
+def test_stability_not_settled_while_drifting():
+    m = StabilityMonitor(tol=0.02, scan_hz=20, hold_s=1.0, max_wait_s=None)
+    base = np.array([40000.0, 20000.0, 60000.0])
+    for k in range(40):
+        st = m.update(base * (1.0 + 0.01 * k))  # steadily rising — never flat
+    assert st["stable"] is False
+    assert st["settled"] is False
+
+
+def test_stability_settles_when_flat():
+    m = StabilityMonitor(tol=0.02, scan_hz=20, hold_s=1.0)  # window = 20 frames
+    base = np.array([40000.0, 20000.0, 60000.0])
+    # needs a full window of flat data before it can declare stable
+    for _ in range(19):
+        st = m.update(base)
+        assert st["stable"] is False  # window not full yet
+    st = m.update(base)
+    assert st["stable"] is True
+    assert st["settled"] is True
+    assert st["max_dev"] == 0.0
+
+
+def test_stability_times_out_and_proceeds():
+    m = StabilityMonitor(tol=0.001, scan_hz=20, hold_s=1.0, max_wait_s=1.5)  # cap 30 frames
+    base = np.array([40000.0, 20000.0, 60000.0])
+    settled = False
+    for k in range(30):
+        st = m.update(base * (1.0 + 0.05 * (k % 3)))  # jittery — never within 0.1%
+    assert st["timed_out"] is True
+    assert st["settled"] is True   # proceeds anyway after max_wait
+    assert st["stable"] is False
+
+
+def test_stability_ignores_open_channel():
+    m = StabilityMonitor(tol=0.02, scan_hz=20, hold_s=0.5)  # window 10
+    base = np.array([40000.0, np.inf, 60000.0])  # channel 1 railed
+    for _ in range(10):
+        st = m.update(base)
+    assert st["stable"] is True   # decided on the finite channels

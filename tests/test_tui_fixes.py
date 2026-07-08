@@ -110,10 +110,10 @@ def test_record_busy_guard(tmp_path):
     async def scenario():
         async with app.run_test() as pilot:
             await pilot.pause()
-            # get the engine into an active capture (arm + one step promotes it)
+            # arm a capture (arm + one step enters SETTLE — engine is now busy)
             app._engine.arm_capture("coffee")
             app._engine.step(ContinuousSim(app.controller.config).read())
-            assert app._engine.capturing is True
+            assert app._engine.busy is True
             logs = []
             app._log = logs.append
             app.action_record()  # must refuse while a sniff is being captured

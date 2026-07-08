@@ -112,7 +112,6 @@ class SniffApp(App):
         self._rep_label = None
         self._reps_remaining = 0
         self._rep_total = 0
-        self._await_recovery = False
         self._servo_started = False     # sent the initial fresh-air command yet?
         # test hooks: inject a bounded frame source + disable real-time pacing
         self._source_factory = source_factory
@@ -259,6 +258,16 @@ class SniffApp(App):
         self._set_nose("sniffing" if phase == "exposure" else "idle")
         self._drive_servo(ev)
 
+        if ev["settle"] is not None:
+            st = ev["settle"]
+            if st["timed_out"]:
+                self._status(f"⏳ settle timed out ({st['waited_s']:.0f}s) — proceeding")
+            else:
+                dev = f"{st['max_dev'] * 100:.1f}%" if st["max_dev"] is not None else "…"
+                self._status(
+                    f"⏳ settling — waiting for a stable baseline ({dev}, {st['waited_s']:.1f}s)"
+                )
+
         if ev["capture"] is not None:
             k, n = ev["capture"]
             pct = k * 100 // n
@@ -272,9 +281,6 @@ class SniffApp(App):
             if rec["recovered"]:
                 if rec["just_recovered"]:
                     self._status("✓ sensors recovered — ready for the next sniff")
-                    if self._await_recovery:
-                        self._await_recovery = False
-                        self._arm_next_rep()  # next rep in the sequence, hands-free
             else:
                 wc = names[rec["worst_channel"]] if rec["worst_channel"] >= 0 else "?"
                 self._status(
@@ -325,8 +331,8 @@ class SniffApp(App):
             self._reps_remaining -= 1
             done = self._rep_total - self._reps_remaining
             if self._reps_remaining > 0:
-                self._await_recovery = True  # gate the next rep on recovery
-                self._log(f"saved {path.name} ({done}/{self._rep_total}) — recovering…")
+                self._log(f"saved {path.name} ({done}/{self._rep_total}) — settling for next…")
+                self._arm_next_rep()  # its SETTLE waits for the sensors to return to rest
             else:
                 self._log(f"saved {path.name} ({done}/{self._rep_total}) — done")
         self._active_label = None
@@ -422,7 +428,7 @@ class SniffApp(App):
     # ---------------------------------------------------------- record
     def action_record(self) -> None:
         self._disarm_clear()
-        if self._engine is None or self._engine.capturing or self._await_recovery:
+        if self._engine is None or self._engine.busy:
             self._log("busy — a capture sequence is already running")
             return
         self._rep_label = self.label
@@ -447,7 +453,7 @@ class SniffApp(App):
     # -------------------------------------------------------- identify
     def action_identify(self) -> None:
         self._disarm_clear()
-        if self._engine is None or self._engine.capturing or self._await_recovery:
+        if self._engine is None or self._engine.busy:
             return
         if not self.controller.has_model():
             self._log("identify: no model yet — press f to fit first")
