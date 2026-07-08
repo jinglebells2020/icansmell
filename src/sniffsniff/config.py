@@ -3,6 +3,12 @@
 Parses ``sniffsniff.toml`` into an immutable :class:`Config`. The channel table
 defines the number of sensors ``N`` (``n_channels``); the rest of the pipeline
 derives ``N`` from here rather than hard-coding it.
+
+The array may be split across **multiple boards** (Arduino Unos). Each board owns
+a contiguous slice of the flat channel vector; :class:`Config` still exposes a
+single flat ``channels`` (concatenated in board order), so everything downstream
+of ingest is unchanged — only the reader (see :mod:`sniffsniff.serialio`) needs
+to know the board layout in order to merge the two serial streams.
 """
 from __future__ import annotations
 
@@ -15,11 +21,29 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Channel:
-    """One channel: its index, the sensor wired to it, and its load resistor."""
+    """One channel: its index, the sensor wired to it, its load resistor, board."""
 
     ch: int
     sensor: str
     rl: float
+    board: int = 0
+
+
+@dataclass(frozen=True)
+class Board:
+    """One physical board (Uno) and where its channels sit in the flat vector.
+
+    ``port`` is the serial device (``None`` for a legacy single-board config, where
+    the port comes from the CLI ``--port``). ``start`` is the offset of this board's
+    first channel in the flat ``Config.channels`` vector; the board owns
+    ``channels[start : start + n_channels]``. ``servo`` marks the board that hosts
+    the airflow servo.
+    """
+
+    port: str | None
+    n_channels: int
+    servo: bool
+    start: int
 
 
 @dataclass(frozen=True)
@@ -27,13 +51,15 @@ class Config:
     """Immutable board + array + timing + feature configuration.
 
     ``channels`` is stored ordered by ``ch`` 0..N-1, so anything ordered by
-    channel index can iterate ``channels`` directly.
+    channel index can iterate ``channels`` directly. ``boards`` describes how the
+    array is split across physical boards (one entry for a single-board rig).
     """
 
     bits: int
     vref: float
     vcc: float
     channels: tuple[Channel, ...]
+    boards: tuple[Board, ...]
     scan_hz: int
     baseline_s: float
     exposure_s: float
@@ -75,12 +101,18 @@ class Config:
     def n_channels(self) -> int:
         return len(self.channels)
 
+    @property
+    def multi_board(self) -> bool:
+        """True when the array spans more than one physical board."""
+        return len(self.boards) > 1
 
-def _build_channels(raw_channels: list[dict]) -> tuple[Channel, ...]:
+
+def _build_channels(raw_channels: list[dict], board: int = 0) -> tuple[Channel, ...]:
     """Validate a raw channel table and return channels ordered by ``ch``.
 
     Requires the ``ch`` values to be exactly the set ``{0..len-1}`` with no
-    duplicates or gaps; raises :class:`ValueError` otherwise.
+    duplicates or gaps; raises :class:`ValueError` otherwise. ``ch`` is the local
+    A-pin index on ``board``.
     """
     n = len(raw_channels)
     if n == 0:
@@ -95,9 +127,37 @@ def _build_channels(raw_channels: list[dict]) -> tuple[Channel, ...]:
 
     ordered = sorted(raw_channels, key=lambda c: int(c["ch"]))
     return tuple(
-        Channel(ch=int(c["ch"]), sensor=str(c["sensor"]), rl=float(c["rl"]))
+        Channel(ch=int(c["ch"]), sensor=str(c["sensor"]), rl=float(c["rl"]), board=board)
         for c in ordered
     )
+
+
+def _build_multiboard(raw_boards: list[dict]) -> tuple[tuple[Channel, ...], tuple[Board, ...]]:
+    """Flatten a list of per-board channel tables into one channel vector + boards.
+
+    Each board's local ``ch`` values must be ``{0..nb-1}``; global channel indices
+    are assigned by concatenating boards in order.
+    """
+    if not raw_boards:
+        raise ValueError("array.board must list at least one board")
+    flat: list[Channel] = []
+    boards: list[Board] = []
+    start = 0
+    for b_idx, board in enumerate(raw_boards):
+        local = _build_channels(list(board["channels"]), board=b_idx)
+        for local_ch, c in enumerate(local):
+            flat.append(Channel(ch=start + local_ch, sensor=c.sensor, rl=c.rl, board=b_idx))
+        nb = len(local)
+        boards.append(
+            Board(
+                port=(str(board["port"]) if board.get("port") is not None else None),
+                n_channels=nb,
+                servo=bool(board.get("servo", False)),
+                start=start,
+            )
+        )
+        start += nb
+    return tuple(flat), tuple(boards)
 
 
 def _config_from_dict(data: dict) -> Config:
@@ -107,15 +167,25 @@ def _config_from_dict(data: dict) -> Config:
     features = data["features"]
     baseline = data["baseline"]
 
-    channels = _build_channels(list(array["channels"]))
     servo = data.get("servo", {})
     capture = data.get("capture", {})
+
+    if "board" in array:  # multi-board: [[array.board]] tables
+        channels, boards = _build_multiboard(list(array["board"]))
+        servo_enabled = any(b.servo for b in boards)
+    else:                 # legacy single board: [array].channels
+        channels = _build_channels(list(array["channels"]))
+        servo_enabled = bool(servo.get("enabled", False))
+        boards = (
+            Board(port=None, n_channels=len(channels), servo=servo_enabled, start=0),
+        )
 
     return Config(
         bits=int(board["bits"]),
         vref=float(board["vref"]),
         vcc=float(array["vcc"]),
         channels=channels,
+        boards=boards,
         scan_hz=int(timing["scan_hz"]),
         baseline_s=float(timing["baseline_s"]),
         exposure_s=float(timing["exposure_s"]),
@@ -124,7 +194,7 @@ def _config_from_dict(data: dict) -> Config:
         ema_alphas=tuple(float(a) for a in features["ema_alphas"]),
         max_cv=float(baseline["max_cv"]),
         recover_tol=float(baseline["recover_tol"]),
-        servo_enabled=bool(servo.get("enabled", False)),
+        servo_enabled=servo_enabled,
         servo_pin=int(servo.get("pin", 12)),
         servo_fresh_air_angle=int(servo.get("fresh_air_angle", 0)),
         servo_sample_angle=int(servo.get("sample_angle", 105)),
@@ -146,7 +216,11 @@ def load_config(path) -> Config:
 
 
 def default_config() -> Config:
-    """Return the built-in defaults matching ``sniffsniff.toml`` (no file read)."""
+    """Return the built-in 6-sensor single-board defaults (no file read).
+
+    This is the Foundation-milestone baseline the test-suite builds on; the shipped
+    ``sniffsniff.toml`` describes the current (dual-board, 9-sensor) rig.
+    """
     channels = (
         Channel(ch=0, sensor="MQ3", rl=1000.0),
         Channel(ch=1, sensor="MQ135", rl=1000.0),
@@ -160,6 +234,7 @@ def default_config() -> Config:
         vref=5.0,
         vcc=5.0,
         channels=channels,
+        boards=(Board(port=None, n_channels=6, servo=True, start=0),),
         scan_hz=20,
         baseline_s=15.0,
         exposure_s=45.0,

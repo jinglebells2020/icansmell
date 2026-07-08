@@ -105,12 +105,13 @@ def _make_reader(args, cfg: Config, *, seed: int | None = None):
         odor = getattr(args, "odor", None) or "coffee"
         frames = Simulator(cfg, seed=s).sniff_frames(odor)
         return SimulatedReader(frames)
-    from .serialio import SerialReader
+    from .serialio import build_reader
 
     # reconnect=False so a bounded capture ends on a silent/absent device instead
     # of looping forever; startup_delay lets the Uno boot after the open-reset.
-    return SerialReader(
-        args.port, n_channels=cfg.n_channels, reconnect=False, startup_delay_s=2.5
+    # build_reader returns a single SerialReader or a MergedReader (multi-board).
+    return build_reader(
+        cfg, port=args.port, reconnect=False, startup_delay_s=2.5
     )
 
 

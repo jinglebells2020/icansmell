@@ -1,0 +1,56 @@
+# sniffsniff — 9-sensor dual-Uno rig, MANUAL airflow (servo OFF)
+#
+# Same rig as sniffsniff.toml but with NO servo flag, so the engine never sends
+# S<angle> commands. Use this while the servo is on USB power (driving it mid-
+# capture browns out the 5 V rail and corrupts the readings). You switch the
+# airflow BY HAND, following the CAPTURE phase stepper in the TUI.
+
+[board]
+bits = 10
+vref = 5.0
+
+[array]
+vcc = 5.0
+
+[[array.board]]                       # Uno 1 — 6 sensors
+port = "/dev/cu.usbmodem101"
+channels = [
+  { ch = 0, sensor = "MQ5",   rl = 1000 },   # A0 — LPG / natural gas
+  { ch = 1, sensor = "MQ3",   rl = 1000 },   # A1 — alcohol / ethanol
+  { ch = 2, sensor = "MQ135", rl = 1000 },   # A2 — VOCs + ammonia
+  { ch = 3, sensor = "MQ7",   rl = 1000 },   # A3 — carbon monoxide
+  { ch = 4, sensor = "MQ9",   rl = 1000 },   # A4 — CO + combustible gas
+  { ch = 5, sensor = "MQ8",   rl = 1000 },   # A5 — hydrogen
+]
+
+[[array.board]]                       # Uno 2 — 3 sensors (servo present but NOT driven)
+port = "/dev/cu.usbmodem1101"
+channels = [
+  { ch = 0, sensor = "MQ2", rl = 1000 },     # A0 — broad smoke / VOC
+  { ch = 1, sensor = "MQ4", rl = 1000 },     # A1 — methane
+  { ch = 2, sensor = "MQ6", rl = 1000 },     # A2 — LPG / propane / butane
+]
+
+[timing]
+scan_hz     = 20
+baseline_s  = 15
+exposure_s  = 45
+purge_s     = 90
+plateau_s   = 10
+
+[features]
+ema_alphas = [0.1, 0.01, 0.001]
+
+[baseline]
+max_cv = 0.05
+recover_tol = 0.02
+
+# no [servo] driving — airflow is manual
+
+[capture]
+settle_hold_s = 3.0
+settle_max_wait_s = 30
+min_exposure_s = 15.0
+plateau_hold_s = 8.0
+plateau_eps = 0.005
+smooth_alpha = 0.2

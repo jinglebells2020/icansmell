@@ -241,10 +241,11 @@ class SniffApp(App):
             # noise-free so the recovery teller (±2%) settles cleanly for the demo;
             # values still move during a sniff. Real hardware has its own noise.
             return ContinuousSim(cfg, seed=ctrl.seed, noise_counts=0.0)
-        from ..serialio import SerialReader
+        from ..serialio import build_reader
 
-        return SerialReader(
-            ctrl.port, n_channels=cfg.n_channels, reconnect=False, startup_delay_s=2.5
+        # single SerialReader, or a MergedReader when the rig spans two boards.
+        return build_reader(
+            cfg, port=ctrl.port, reconnect=False, startup_delay_s=2.5
         )
 
     def _start_monitor(self) -> None:

@@ -27,17 +27,21 @@
  *   angles are mechanical — find them with `sniffsniff servo` and set them in
  *   sniffsniff.toml ([servo] fresh_air_angle / sample_angle).
  *
+ * This is UNO 1 (primary) of the dual-Uno 9-sensor rig — 6 sensors + the airflow
+ * servo. Uno 2 (the other 3 sensors, no servo) runs firmware/sniffsniff_uno_b.
+ * The Python host merges the two boards' streams into one 9-channel frame.
+ *
  * DIRECT ANALOG WIRING — each MQ module's AO (analog out) goes straight to an
  * Uno analog input pin. There is NO multiplexer. Channel order C0..C5 maps to:
  *
- *     A0 -> MQ3    (C0)
- *     A1 -> MQ135  (C1)
- *     A2 -> MQ2    (C2)
- *     A3 -> MQ4    (C3)
- *     A4 -> MQ8    (C4)
- *     A5 -> MQ7    (C5)
+ *     A0 -> MQ5    (C0)   LPG / natural gas
+ *     A1 -> MQ3    (C1)   alcohol / ethanol
+ *     A2 -> MQ135  (C2)   VOCs + ammonia
+ *     A3 -> MQ7    (C3)   carbon monoxide
+ *     A4 -> MQ9    (C4)   CO + combustible gas
+ *     A5 -> MQ8    (C5)   hydrogen
  *
- * So sensor order (C0..C5) is: MQ3, MQ135, MQ2, MQ4, MQ8, MQ7.
+ * So sensor order (C0..C5) is: MQ5, MQ3, MQ135, MQ7, MQ9, MQ8.
  *
  * ---------------------------------------------------------------------------
  * HARDWARE MUST-DOS (read before powering the array):

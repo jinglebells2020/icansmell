@@ -216,13 +216,14 @@ def test_simulated_reader_frames_is_iterator():
 def test_respects_config_n_channels():
     """r_base default and frame width derive from config.n_channels, not a
     hard-coded 6 (gain vectors are still 6-aligned but sliced to N)."""
-    from sniffsniff.config import Config, Channel
+    from sniffsniff.config import Board, Config, Channel
 
     channels = tuple(
         Channel(ch=i, sensor=f"S{i}", rl=1000.0) for i in range(3)
     )
     cfg = Config(
         bits=10, vref=5.0, vcc=5.0, channels=channels,
+        boards=(Board(port=None, n_channels=3, servo=False, start=0),),
         scan_hz=20, baseline_s=1.0, exposure_s=1.0, purge_s=1.0, plateau_s=0.5,
         ema_alphas=(0.1, 0.01, 0.001), max_cv=0.05, recover_tol=0.02,
     )
@@ -235,3 +236,48 @@ def test_tau_decay_slower_than_rise():
     """Purge desorption must be slower than exposure adsorption (spec: tau_decay > tau_rise)."""
     sim = Simulator(default_config(), seed=0)
     assert sim.tau_decay > sim.tau_rise
+
+
+# --- dual-Uno 9-sensor rig ----------------------------------------------------
+
+def _repo_toml():
+    from pathlib import Path
+    return Path(__file__).resolve().parents[1] / "sniffsniff.toml"
+
+
+def test_simulator_9ch_rig_new_sensors_are_alive():
+    """The shipped dual-Uno rig: frames are 9 wide and the new MQ5/MQ6/MQ9 sensors
+    actually respond to an odor that gives them gain (they aren't dead in sim)."""
+    from sniffsniff.config import load_config
+
+    cfg = load_config(_repo_toml())
+    assert cfg.n_channels == 9
+    sim = Simulator(cfg, seed=0, noise_counts=0.0)
+    frames = sim.sniff_frames("fresh_milk")
+    assert frames[0][1].shape == (9,)
+
+    names = cfg.sensor_names()
+    n_base = int(round(cfg.baseline_s * cfg.scan_hz))
+    n_exp = int(round(cfg.exposure_s * cfg.scan_hz))
+    base = frames[0][1].astype(float)
+    exp_end = frames[n_base + n_exp - 1][1].astype(float)
+    for s in ("MQ5", "MQ6", "MQ9"):
+        i = names.index(s)
+        assert abs(exp_end[i] - base[i]) > 1.0, f"{s} stayed flat for fresh_milk"
+
+
+def test_record_9ch_rig_yields_72d_features(tmp_path):
+    """End-to-end: a 9-channel sim sniff records a 72-D feature vector (8 × 9)."""
+    import dataclasses
+    import warnings
+
+    from sniffsniff.config import load_config
+    from sniffsniff.record import SniffRecorder
+
+    cfg = load_config(_repo_toml())
+    cfg = dataclasses.replace(cfg, baseline_s=1, exposure_s=2, purge_s=1, plateau_s=0.5)
+    frames = Simulator(cfg, seed=0).sniff_frames("coffee")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = SniffRecorder(cfg, tmp_path).process(frames, "coffee")
+    assert result.features.shape == (72,)

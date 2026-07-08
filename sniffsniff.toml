@@ -1,5 +1,10 @@
-# sniffsniff configuration — 6-sensor MQ array (Foundation milestone)
-# The number of channel entries below defines N. Confirm/measure RL per module.
+# sniffsniff configuration — 9-sensor MQ array across TWO Arduino Unos
+#
+# The two boards are merged EQUALLY into one 9-channel frame (in board order):
+#   Uno 1: MQ5 MQ3 MQ135 MQ7 MQ9 MQ8   |   Uno 2: MQ2 MQ4 MQ6
+# `ch` below is the LOCAL analog pin (A0=ch0 …) on that board; global channel
+# indices 0..8 are assigned by concatenating the boards in order.
+# (A single-board rig can still use a flat [array].channels table — see git history.)
 
 [board]
 bits = 10          # Uno ADC resolution (10-bit → counts 0..1023)
@@ -7,15 +12,25 @@ vref = 5.0         # Uno ADC reference volts
 
 [array]
 vcc = 5.0          # sensor supply volts
-# one entry per channel C0..C5 — direct wiring, each module's AO -> an Uno analog pin
-# (A0=ch0, A1=ch1, A2=ch2, A3=ch3, A4=ch4, A5=ch5; no multiplexer)
+
+[[array.board]]                       # Uno 1 — 6 sensors
+port = "/dev/cu.usbmodem101"          # <-- set to this Uno's serial device
 channels = [
-  { ch = 0, sensor = "MQ3",   rl = 1000 },
-  { ch = 1, sensor = "MQ135", rl = 1000 },
-  { ch = 2, sensor = "MQ2",   rl = 1000 },
-  { ch = 3, sensor = "MQ4",   rl = 1000 },
-  { ch = 4, sensor = "MQ8",   rl = 1000 },
-  { ch = 5, sensor = "MQ7",   rl = 1000 },
+  { ch = 0, sensor = "MQ5",   rl = 1000 },   # A0 — LPG / natural gas
+  { ch = 1, sensor = "MQ3",   rl = 1000 },   # A1 — alcohol / ethanol
+  { ch = 2, sensor = "MQ135", rl = 1000 },   # A2 — VOCs + ammonia
+  { ch = 3, sensor = "MQ7",   rl = 1000 },   # A3 — carbon monoxide
+  { ch = 4, sensor = "MQ9",   rl = 1000 },   # A4 — CO + combustible gas
+  { ch = 5, sensor = "MQ8",   rl = 1000 },   # A5 — hydrogen
+]
+
+[[array.board]]                       # Uno 2 — 3 sensors + airflow servo (servo on D12)
+port = "/dev/cu.usbmodem1101"         # <-- set to this Uno's serial device
+servo = true                          # the airflow servo is wired to THIS board
+channels = [
+  { ch = 0, sensor = "MQ2", rl = 1000 },     # A0 — broad smoke / VOC
+  { ch = 1, sensor = "MQ4", rl = 1000 },     # A1 — methane
+  { ch = 2, sensor = "MQ6", rl = 1000 },     # A2 — LPG / propane / butane
 ]
 
 [timing]
@@ -32,19 +47,15 @@ ema_alphas = [0.1, 0.01, 0.001]
 max_cv = 0.05      # reject baseline if any channel CV exceeds this
 recover_tol = 0.02 # ±2% of R0 to count as recovered
 
-[servo]
-enabled = true         # drive the airflow servo automatically during a capture
-pin = 12               # servo signal pin (documented in firmware; host just sends S<angle>)
-fresh_air_angle = 0    # substance closed / fresh-air straw open (baseline & purge)
-sample_angle = 105     # substance open / fresh-air closed (exposure)
+[servo]                # servo lives on the board flagged servo=true above
+pin = 12               # servo signal pin (documented in firmware; host sends S<angle>)
+fresh_air_angle = 0    # fresh-air straw open (baseline & purge)
+sample_angle = 105     # sample straw open (exposure)
 
 [capture]              # adaptive-capture tuning (tolerance reuses recover_tol)
 settle_hold_s = 3.0    # signal must be flat this long before measuring R0
 settle_max_wait_s = 30 # give up settling after this and proceed anyway
-# Dynamic exposure ends when the response STOPS GROWING (no new high for
-# plateau_hold_s), never before min_exposure_s, capped by [timing] exposure_s.
-# Tuned on the real rig: weak/slow odors (milk) ride to the cap; strong odors stop early.
 min_exposure_s = 15.0  # exposure floor — never plateau-stop before this
-plateau_hold_s = 8.0   # end after the response sets no new high (>= plateau_eps) this long
-plateau_eps = 0.005    # min fractional growth (0.5pp of R0) counted as a genuine new high
+plateau_hold_s = 8.0   # end after the response sets no new high this long
+plateau_eps = 0.005    # min fractional growth counted as a genuine new high
 smooth_alpha = 0.2     # EMA smoothing for the settle/recovery detectors (0 = off)

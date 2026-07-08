@@ -333,3 +333,186 @@ def test_write_command_writes_when_open():
     assert r.write_command("S105") is True
     assert r.write_command("S0\n") is True  # already-newline'd not doubled
     assert fake.written == b"S105\nS0\n"
+
+
+# --------------------------------------------------------------------------- #
+# merge_counts + MergedReader + build_reader (dual-Uno ingest)
+# --------------------------------------------------------------------------- #
+
+import time  # noqa: E402
+
+from sniffsniff.config import Board, Channel, Config, default_config, load_config  # noqa: E402
+from sniffsniff.serialio import MergedReader, build_reader, merge_counts  # noqa: E402
+
+
+class _FakeBoard:
+    """A board reader stand-in: yields queued frames (optionally forever)."""
+
+    def __init__(self, frames, loop=True, delay=0.001):
+        self._frames = list(frames)
+        self._loop = loop
+        self._delay = delay
+        self.cmds = []
+        self.closed = False
+
+    def frames(self):
+        while True:
+            for f in self._frames:
+                yield f
+                time.sleep(self._delay)
+            if not self._loop:
+                return
+
+    def write_command(self, text):
+        self.cmds.append(text)
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+def _collect(reader, n, cap=500):
+    out = []
+    for f in reader.frames():
+        out.append(f)
+        if len(out) >= n:
+            break
+        if len(out) >= cap:
+            break
+    reader.close()
+    return out
+
+
+# --- merge_counts (pure) -----------------------------------------------------
+
+def test_merge_counts_concatenates_in_order():
+    merged = merge_counts([np.array([1, 2, 3]), np.array([7, 8])], [3, 2])
+    np.testing.assert_array_equal(merged, [1, 2, 3, 7, 8])
+    assert merged.dtype == np.int64
+
+
+def test_merge_counts_zero_fills_a_missing_board():
+    merged = merge_counts([np.array([1, 2, 3]), None], [3, 2])
+    np.testing.assert_array_equal(merged, [1, 2, 3, 0, 0])
+
+
+# --- MergedReader (threaded, fake boards) ------------------------------------
+
+def test_merged_reader_combines_two_streams():
+    a = _FakeBoard([(0, np.array([1, 2, 3], dtype=np.int64))])
+    b = _FakeBoard([(0, np.array([7, 8], dtype=np.int64))])
+    mr = MergedReader([a, b], [3, 2], scan_hz=200, start_timeout_s=2.0)
+    frames = _collect(mr, 3)
+    assert len(frames) == 3
+    for _, counts in frames:
+        assert counts.shape == (5,)
+        np.testing.assert_array_equal(counts[:3], [1, 2, 3])
+        np.testing.assert_array_equal(counts[3:], [7, 8])
+    # host-clocked timestamps step by step_ms (1000/200 = 5)
+    assert frames[0][0] == 0
+    assert frames[1][0] == 5
+
+
+def test_merged_reader_holds_last_when_a_board_stalls():
+    a = _FakeBoard([(0, np.array([1, 1, 1], dtype=np.int64))])         # forever
+    b = _FakeBoard([(0, np.array([9, 9], dtype=np.int64))], loop=False)  # once, then stops
+    mr = MergedReader([a, b], [3, 2], scan_hz=200, start_timeout_s=2.0)
+    frames = _collect(mr, 5)
+    assert len(frames) == 5
+    for _, counts in frames:
+        np.testing.assert_array_equal(counts[3:], [9, 9])  # b's last value held
+
+
+def test_merged_reader_startup_timeout_when_a_board_is_silent():
+    a = _FakeBoard([(0, np.array([1, 1, 1], dtype=np.int64))])
+    silent = _FakeBoard([], loop=False)  # never yields
+    mr = MergedReader([a, silent], [3, 2], scan_hz=200, start_timeout_s=0.2)
+    with pytest.raises(RuntimeError):
+        for _ in mr.frames():
+            break
+    mr.close()
+
+
+def test_merged_reader_write_command_routes_to_servo_board():
+    a = _FakeBoard([(0, np.array([1], dtype=np.int64))])
+    b = _FakeBoard([(0, np.array([2], dtype=np.int64))])
+    mr = MergedReader([a, b], [1, 1], servo_index=1)
+    assert mr.write_command("S105") is True
+    assert b.cmds == ["S105"]
+    assert a.cmds == []
+
+
+def test_merged_reader_close_closes_all_boards():
+    a = _FakeBoard([(0, np.array([1], dtype=np.int64))])
+    b = _FakeBoard([(0, np.array([2], dtype=np.int64))])
+    mr = MergedReader([a, b], [1, 1])
+    mr.close()
+    assert a.closed and b.closed
+
+
+# --- build_reader factory ----------------------------------------------------
+
+def test_build_reader_single_board_returns_serialreader():
+    r = build_reader(default_config(), port="PORTX", reconnect=False)
+    assert isinstance(r, SerialReader)
+    assert r.n_channels == 6
+
+
+def _dual_cfg():
+    return Config(
+        bits=10, vref=5.0, vcc=5.0,
+        channels=(
+            Channel(0, "MQ5", 1000.0, 0), Channel(1, "MQ3", 1000.0, 0),
+            Channel(2, "MQ2", 1000.0, 1),
+        ),
+        boards=(Board("/dev/a", 2, True, 0), Board("/dev/b", 1, False, 2)),
+        scan_hz=20, baseline_s=1, exposure_s=1, purge_s=1, plateau_s=1,
+        ema_alphas=(0.1,), max_cv=0.05, recover_tol=0.02,
+    )
+
+
+def test_build_reader_multiboard_returns_mergedreader():
+    r = build_reader(_dual_cfg(), reconnect=False)
+    assert isinstance(r, MergedReader)
+    assert len(r._readers) == 2
+    assert r._widths == [2, 1]
+    assert r._servo_index == 0  # board 0 has the servo
+
+
+class _LoopingSerial:
+    """A byte source that repeats its CSV lines forever (a live board that keeps
+    streaming), so a SerialReader over it never hits end-of-stream."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+        self._i = 0
+        self.closed = False
+
+    def readline(self):
+        line = self._lines[self._i % len(self._lines)]
+        self._i += 1
+        return line
+
+    def close(self):
+        self.closed = True
+
+
+def test_build_reader_multiboard_merges_two_real_serial_streams(tmp_path):
+    """Full path: build_reader -> MergedReader -> two SerialReaders parsing CSV ->
+    one merged 9-channel frame in board order."""
+    from pathlib import Path
+
+    cfg = load_config(Path(__file__).resolve().parents[1] / "sniffsniff.toml")
+    assert cfg.n_channels == 9
+    a = _LoopingSerial([b"1,10,11,12,13,14,15\n"])   # Uno 1: 6 counts
+    b = _LoopingSerial([b"2,70,71,72\n"])            # Uno 2: 3 counts
+    reader = build_reader(cfg, openers=[lambda: a, lambda: b])
+    assert isinstance(reader, MergedReader)
+
+    frames = _collect(reader, 2)
+    assert len(frames) == 2
+    for _, counts in frames:
+        assert counts.shape == (9,)
+        np.testing.assert_array_equal(counts[:6], [10, 11, 12, 13, 14, 15])
+        np.testing.assert_array_equal(counts[6:], [70, 71, 72])
+    assert a.closed and b.closed

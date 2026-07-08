@@ -22,7 +22,7 @@ from ..dataset import load_dataset
 from ..geometry import serialize_geometry
 from ..model import SmellModel, cross_val_accuracy
 from ..record import SniffRecorder, clear_dataset, delete_last_sniff
-from ..serialio import SerialReader
+from ..serialio import build_reader
 from ..simulator import SimulatedReader, Simulator
 
 __all__ = [
@@ -79,7 +79,12 @@ class SniffController:
         """
         if self.use_sim:
             return True
-        return os.path.exists(self.port)
+        return all(os.path.exists(p) for p in self._board_ports())
+
+    def _board_ports(self) -> list[str]:
+        """Effective serial device paths per board (``self.port`` fills a None)."""
+        ports = [b.port or self.port for b in self.config.boards]
+        return [p for p in ports if p] or [self.port]
 
     def has_model(self) -> bool:
         """Whether a trained model exists at :attr:`model_path`."""
@@ -104,11 +109,9 @@ class SniffController:
         # reconnect=False: a bounded capture must NOT loop forever on a present-but-
         # silent device (readline timing out to b"") — it ends and we report no data.
         # startup_delay: opening the port resets the Uno; wait for it to boot+stream.
-        return SerialReader(
-            self.port,
-            n_channels=self.config.n_channels,
-            reconnect=False,
-            startup_delay_s=2.5,
+        # build_reader returns a single SerialReader or a MergedReader (multi-board).
+        return build_reader(
+            self.config, port=self.port, reconnect=False, startup_delay_s=2.5
         )
 
     # ---------------------------------------------------------------- record

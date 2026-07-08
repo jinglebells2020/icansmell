@@ -8,6 +8,9 @@ REPO_TOML = "sniffsniff.toml"  # resolved relative to repo root below
 
 EXPECTED_SENSORS = ["MQ3", "MQ135", "MQ2", "MQ4", "MQ8", "MQ7"]
 
+# The shipped sniffsniff.toml is the current dual-Uno, 9-sensor rig.
+DUAL_SENSORS = ["MQ5", "MQ3", "MQ135", "MQ7", "MQ9", "MQ8", "MQ2", "MQ4", "MQ6"]
+
 
 def _repo_root():
     # tests/ is directly under the repo root
@@ -93,20 +96,29 @@ def test_load_config_round_trips_repo_toml():
     path = _repo_root() / REPO_TOML
     assert path.exists(), f"expected {path} to exist"
     cfg = load_config(path)
-    assert cfg == default_config()
+    # shipped rig is the dual-Uno, 9-sensor array
+    assert cfg.n_channels == 9
+    assert cfg.sensor_names() == DUAL_SENSORS
+    assert cfg.multi_board is True
+    assert len(cfg.boards) == 2
+    assert cfg.boards[0].n_channels == 6 and cfg.boards[1].n_channels == 3
+    # the airflow servo is wired to Uno 2 (the 3-sensor board)
+    assert cfg.boards[0].servo is False and cfg.boards[1].servo is True
+    assert cfg.servo_enabled is True
 
 
 def test_load_config_accepts_str_path():
     path = _repo_root() / REPO_TOML
     cfg = load_config(str(path))
-    assert cfg == default_config()
+    assert cfg.n_channels == 9
+    assert cfg.sensor_names() == DUAL_SENSORS
 
 
 def test_load_config_channel_count_matches(tmp_path):
     path = _repo_root() / REPO_TOML
     cfg = load_config(path)
-    assert cfg.n_channels == 6
-    assert cfg.sensor_names() == EXPECTED_SENSORS
+    assert cfg.n_channels == 9
+    assert cfg.sensor_names() == DUAL_SENSORS
 
 
 # --- load_config validation ---------------------------------------------------
@@ -265,3 +277,103 @@ def test_default_config_has_capture_tuning():
     assert c.plateau_hold_s == 8.0
     assert c.plateau_eps == 0.005
     assert c.smooth_alpha == 0.2
+
+
+# --- multi-board (dual-Uno) parsing ------------------------------------------
+
+_DUAL_HEADER = """
+[board]
+bits = 10
+vref = 5.0
+
+[array]
+vcc = 5.0
+
+[[array.board]]
+port = "/dev/ttyA"
+servo = true
+channels = [
+  { ch = 0, sensor = "MQ5",   rl = 1000 },
+  { ch = 1, sensor = "MQ3",   rl = 1000 },
+  { ch = 2, sensor = "MQ135", rl = 1100 },
+]
+
+[[array.board]]
+port = "/dev/ttyB"
+channels = [
+  { ch = 0, sensor = "MQ2", rl = 2000 },
+  { ch = 1, sensor = "MQ4", rl = 2000 },
+]
+"""
+
+
+def _write_dual(tmp_path, header=_DUAL_HEADER):
+    p = tmp_path / "dual.toml"
+    p.write_text(header + _TIMING_TAIL)
+    return p
+
+
+def test_multiboard_flattens_channels_in_board_order(tmp_path):
+    cfg = load_config(_write_dual(tmp_path))
+    assert cfg.n_channels == 5
+    assert cfg.sensor_names() == ["MQ5", "MQ3", "MQ135", "MQ2", "MQ4"]
+    assert [c.ch for c in cfg.channels] == [0, 1, 2, 3, 4]
+    assert [c.board for c in cfg.channels] == [0, 0, 0, 1, 1]
+    np.testing.assert_array_equal(
+        cfg.rl_array(), np.array([1000.0, 1000.0, 1100.0, 2000.0, 2000.0])
+    )
+
+
+def test_multiboard_board_layout_and_ports(tmp_path):
+    cfg = load_config(_write_dual(tmp_path))
+    assert cfg.multi_board is True
+    assert len(cfg.boards) == 2
+    b0, b1 = cfg.boards
+    assert (b0.port, b0.n_channels, b0.servo, b0.start) == ("/dev/ttyA", 3, True, 0)
+    assert (b1.port, b1.n_channels, b1.servo, b1.start) == ("/dev/ttyB", 2, False, 3)
+
+
+def test_multiboard_servo_enabled_derived_from_boards(tmp_path):
+    cfg = load_config(_write_dual(tmp_path))
+    assert cfg.servo_enabled is True  # board 0 has servo=true
+
+
+def test_multiboard_rejects_bad_local_ch(tmp_path):
+    bad = """
+[board]
+bits = 10
+vref = 5.0
+[array]
+vcc = 5.0
+[[array.board]]
+port = "/dev/ttyA"
+channels = [ {ch=0,sensor="MQ5",rl=1000}, {ch=2,sensor="MQ3",rl=1000} ]
+"""
+    p = tmp_path / "bad.toml"
+    p.write_text(bad + _TIMING_TAIL)
+    with pytest.raises(ValueError):
+        load_config(p)
+
+
+def test_legacy_single_board_has_one_board(tmp_path):
+    # a flat [array].channels config parses as a single board (port None)
+    block = """
+channels = [
+  { ch = 0, sensor = "MQ2", rl = 1000 },
+  { ch = 1, sensor = "MQ3", rl = 1000 },
+]
+"""
+    cfg = load_config(_write_toml(tmp_path, block))
+    assert cfg.multi_board is False
+    assert len(cfg.boards) == 1
+    assert cfg.boards[0].port is None
+    assert cfg.boards[0].n_channels == 2
+    assert cfg.boards[0].start == 0
+
+
+def test_default_config_has_single_board():
+    cfg = default_config()
+    assert cfg.multi_board is False
+    assert len(cfg.boards) == 1
+    assert cfg.boards[0].n_channels == 6
+    assert cfg.boards[0].servo is True

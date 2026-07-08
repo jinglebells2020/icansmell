@@ -43,18 +43,27 @@ __all__ = ["ODOR_PROFILES", "Simulator", "SimulatedReader"]
 #   * coffee broad / moderate across the array
 #   * fresh vs spoiled milk pulled apart via MQ4/MQ7/MQ8
 # Unknown sensors default to 0 gain (see Simulator._gain). clean_air is empty.
+# The 9-sensor dual-Uno rig adds MQ-5 / MQ-6 (LPG / natural gas — track the
+# methane / fermentation axis alongside MQ-4) and MQ-9 (CO + combustibles — pairs
+# with MQ-7 on the CO shift). Sensors absent from a profile default to 0 gain, so
+# smaller arrays are unaffected.
 ODOR_PROFILES: dict[str, dict[str, float]] = {
     "clean_air": {},
     # broad responder, moderate everywhere, MQ2/MQ135 a touch higher
-    "coffee": {"MQ2": 0.9, "MQ3": 0.6, "MQ4": 0.4, "MQ7": 0.3, "MQ8": 0.35, "MQ135": 0.7},
+    "coffee": {"MQ2": 0.9, "MQ3": 0.6, "MQ4": 0.4, "MQ7": 0.3, "MQ8": 0.35, "MQ135": 0.7,
+               "MQ5": 0.4, "MQ6": 0.4, "MQ9": 0.35},
     # acetic acid: strong on MQ135 (VOC/ammonia), modest MQ2/MQ3
-    "vinegar": {"MQ2": 0.4, "MQ3": 0.5, "MQ4": 0.2, "MQ7": 0.2, "MQ8": 0.2, "MQ135": 1.4},
+    "vinegar": {"MQ2": 0.4, "MQ3": 0.5, "MQ4": 0.2, "MQ7": 0.2, "MQ8": 0.2, "MQ135": 1.4,
+                "MQ5": 0.2, "MQ6": 0.2, "MQ9": 0.2},
     # ethanol: dominant on MQ3, some MQ2 smoke/VOC bleed
-    "alcohol": {"MQ2": 0.6, "MQ3": 1.6, "MQ4": 0.3, "MQ7": 0.2, "MQ8": 0.3, "MQ135": 0.4},
-    # fresh milk: mild, leans on the methane axis (MQ4), low MQ135
-    "fresh_milk": {"MQ2": 0.3, "MQ3": 0.2, "MQ4": 0.7, "MQ7": 0.5, "MQ8": 0.2, "MQ135": 0.3},
-    # spoiled milk: MQ135 punchline + H2/CO shift (MQ8/MQ7), less MQ4 than fresh
-    "spoiled_milk": {"MQ2": 0.5, "MQ3": 0.3, "MQ4": 0.3, "MQ7": 0.8, "MQ8": 0.7, "MQ135": 1.2},
+    "alcohol": {"MQ2": 0.6, "MQ3": 1.6, "MQ4": 0.3, "MQ7": 0.2, "MQ8": 0.3, "MQ135": 0.4,
+                "MQ5": 0.3, "MQ6": 0.3, "MQ9": 0.25},
+    # fresh milk: mild, leans on the methane / LPG axis (MQ4/MQ5/MQ6), low MQ135
+    "fresh_milk": {"MQ2": 0.3, "MQ3": 0.2, "MQ4": 0.7, "MQ7": 0.5, "MQ8": 0.2, "MQ135": 0.3,
+                   "MQ5": 0.6, "MQ6": 0.5, "MQ9": 0.3},
+    # spoiled milk: MQ135 punchline + H2/CO shift (MQ8/MQ7/MQ9), less MQ4/MQ5 than fresh
+    "spoiled_milk": {"MQ2": 0.5, "MQ3": 0.3, "MQ4": 0.3, "MQ7": 0.8, "MQ8": 0.7, "MQ135": 1.2,
+                     "MQ5": 0.4, "MQ6": 0.35, "MQ9": 0.7},
 }
 
 
