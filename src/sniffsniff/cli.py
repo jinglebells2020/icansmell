@@ -381,6 +381,40 @@ def _add_dataset_source_args(parser) -> None:
     parser.add_argument("--seed", type=int, default=0)
 
 
+def _cmd_servo(args) -> int:
+    """Move the airflow servo, or sweep angles interactively to calibrate it.
+
+    Find the angle where the FRESH-AIR straw is open (baseline/purge) and the
+    angle where the SAMPLE straw is open (exposure); put both in sniffsniff.toml.
+    """
+    from .servo import ServoLink
+
+    link = ServoLink(args.port)
+    try:
+        if args.angle is not None:
+            print(f"servo → {link.move(args.angle)}°")
+            return 0
+        print("Servo calibration — type an angle 0-180 and Enter to move it (q to quit).")
+        print("Note the angle where the FRESH-AIR straw opens (baseline/purge) and")
+        print("the angle where the SAMPLE straw opens (exposure).")
+        while True:
+            try:
+                s = input("angle> ").strip()
+            except EOFError:
+                break
+            if s.lower() in ("q", "quit", "exit", ""):
+                break
+            try:
+                angle = int(s)
+            except ValueError:
+                print("  enter a whole number 0-180, or q to quit")
+                continue
+            print(f"  → {link.move(angle)}°")
+    finally:
+        link.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sniffsniff", description="6-sensor MQ e-nose")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -463,6 +497,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--label", default="coffee", help="default record label")
     p_tui.add_argument("--seed", type=int, default=0)
     p_tui.set_defaults(func=_cmd_tui)
+
+    p_servo = sub.add_parser(
+        "servo", help="move / calibrate the airflow servo (find the two angles)"
+    )
+    p_servo.add_argument("--port", default="/dev/cu.usbmodem101", help="serial port")
+    p_servo.add_argument(
+        "--angle", type=int, default=None,
+        help="move to this angle (0-180) and exit; omit for an interactive sweep",
+    )
+    p_servo.set_defaults(func=_cmd_servo)
 
     return parser
 
