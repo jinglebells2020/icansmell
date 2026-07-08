@@ -49,6 +49,13 @@ class Config:
     servo_pin: int = 12
     servo_fresh_air_angle: int = 0
     servo_sample_angle: int = 105
+    # Adaptive-capture tuning: wait for a stable baseline before R0, gate exposure
+    # on a plateau, and EMA-smooth the live signal so per-frame noise doesn't fool
+    # the settle/recovery detectors. Tolerance reuses ``recover_tol``.
+    settle_hold_s: float = 3.0        # signal must be flat this long before baseline
+    settle_max_wait_s: float = 30.0   # give up settling after this (proceed anyway)
+    plateau_hold_s: float = 3.0       # exposure ends after the response is flat this long
+    smooth_alpha: float = 0.2         # EMA factor for the detectors (0 = no smoothing)
 
     def rl_array(self) -> np.ndarray:
         """Per-channel load resistances, shape ``(N,)`` float64, ordered by ch."""
@@ -96,6 +103,7 @@ def _config_from_dict(data: dict) -> Config:
 
     channels = _build_channels(list(array["channels"]))
     servo = data.get("servo", {})
+    capture = data.get("capture", {})
 
     return Config(
         bits=int(board["bits"]),
@@ -114,6 +122,10 @@ def _config_from_dict(data: dict) -> Config:
         servo_pin=int(servo.get("pin", 12)),
         servo_fresh_air_angle=int(servo.get("fresh_air_angle", 0)),
         servo_sample_angle=int(servo.get("sample_angle", 105)),
+        settle_hold_s=float(capture.get("settle_hold_s", 3.0)),
+        settle_max_wait_s=float(capture.get("settle_max_wait_s", 30.0)),
+        plateau_hold_s=float(capture.get("plateau_hold_s", 3.0)),
+        smooth_alpha=float(capture.get("smooth_alpha", 0.2)),
     )
 
 
@@ -152,4 +164,8 @@ def default_config() -> Config:
         servo_pin=12,
         servo_fresh_air_angle=0,
         servo_sample_angle=105,
+        settle_hold_s=3.0,
+        settle_max_wait_s=30.0,
+        plateau_hold_s=3.0,
+        smooth_alpha=0.2,
     )

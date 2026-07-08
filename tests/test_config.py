@@ -255,3 +255,11 @@ recover_tol=0.02
     assert c.servo_enabled is False        # absent section -> disabled
     assert c.servo_fresh_air_angle == 0
     assert c.servo_sample_angle == 105
+
+
+def test_default_config_has_capture_tuning():
+    c = default_config()
+    assert c.settle_hold_s == 3.0
+    assert c.settle_max_wait_s == 30.0
+    assert c.plateau_hold_s == 3.0
+    assert c.smooth_alpha == 0.2

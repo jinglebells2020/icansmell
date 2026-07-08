@@ -37,3 +37,9 @@ enabled = true         # drive the airflow servo automatically during a capture
 pin = 12               # servo signal pin (documented in firmware; host just sends S<angle>)
 fresh_air_angle = 0    # substance closed / fresh-air straw open (baseline & purge)
 sample_angle = 105     # substance open / fresh-air closed (exposure)
+
+[capture]              # adaptive-capture tuning (tolerance reuses recover_tol)
+settle_hold_s = 3.0    # signal must be flat this long before measuring R0
+settle_max_wait_s = 30 # give up settling after this and proceed anyway
+plateau_hold_s = 3.0   # exposure ends after the response holds flat this long
+smooth_alpha = 0.2     # EMA smoothing for the settle/recovery detectors (0 = off)

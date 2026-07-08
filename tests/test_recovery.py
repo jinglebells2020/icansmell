@@ -129,3 +129,41 @@ def test_stability_ignores_open_channel():
     for _ in range(10):
         st = m.update(base)
     assert st["stable"] is True   # decided on the finite channels
+
+
+# --- EMA smoothing (robustness to per-frame noise) ---------------------------
+
+def test_stability_smoothing_settles_noisy_flat():
+    rng = np.random.default_rng(0)
+    base = np.array([40000.0, 20000.0, 60000.0])
+    # ~4% per-frame noise exceeds a 2% tol raw; EMA smoothing tames it so a
+    # noisy-but-flat signal still reaches 'stable'.
+    m = StabilityMonitor(tol=0.02, scan_hz=20, hold_s=2.0, ema_alpha=0.1)
+    settled = False
+    for _ in range(600):
+        if m.update(base * (1 + 0.04 * rng.standard_normal(3)))["stable"]:
+            settled = True
+            break
+    assert settled
+
+
+def test_stability_without_smoothing_stays_jittery():
+    rng = np.random.default_rng(0)
+    base = np.array([40000.0, 20000.0, 60000.0])
+    m = StabilityMonitor(tol=0.02, scan_hz=20, hold_s=2.0)  # no smoothing
+    ever = any(
+        m.update(base * (1 + 0.04 * rng.standard_normal(3)))["stable"] for _ in range(200)
+    )
+    assert ever is False  # raw 4% noise never flat within 2%
+
+
+def test_recovery_smoothing_reaches_recovered_under_noise():
+    rng = np.random.default_rng(1)
+    r0 = np.array([40000.0, 20000.0, 60000.0])
+    m = RecoveryMonitor(r0, tol=0.02, scan_hz=20, hold_s=1.0, ema_alpha=0.1)
+    recovered = False
+    for _ in range(600):
+        if m.update(r0 * (1 + 0.03 * rng.standard_normal(3)))["recovered"]:
+            recovered = True
+            break
+    assert recovered  # smoothed signal at baseline is judged recovered despite noise

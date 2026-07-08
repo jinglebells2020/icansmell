@@ -42,12 +42,15 @@ class StabilityMonitor:
         Give up waiting after this long (``None`` = wait indefinitely).
     """
 
-    def __init__(self, tol: float, scan_hz: int, hold_s: float = 3.0, max_wait_s=30.0):
+    def __init__(self, tol: float, scan_hz: int, hold_s: float = 3.0, max_wait_s=30.0,
+                 ema_alpha=None):
         self.tol = float(tol)
         self.scan_hz = int(scan_hz)
         self.hold_s = float(hold_s)
         self.win = max(1, round(hold_s * scan_hz))
         self.max_wait = None if max_wait_s is None else max(1, round(max_wait_s * scan_hz))
+        self.ema_alpha = None if ema_alpha is None else float(ema_alpha)
+        self._ema = None
         self._buf: deque = deque(maxlen=self.win)
         self._count = 0
 
@@ -59,7 +62,14 @@ class StabilityMonitor:
         until the window fills), ``waited_s``, and ``timed_out``.
         """
         self._count += 1
-        self._buf.append(np.asarray(rs, dtype=np.float64))
+        rs = np.asarray(rs, dtype=np.float64)
+        if self.ema_alpha is not None:
+            self._ema = (
+                rs.copy() if self._ema is None
+                else self.ema_alpha * rs + (1.0 - self.ema_alpha) * self._ema
+            )
+            rs = self._ema
+        self._buf.append(rs.copy())
 
         stable = False
         max_dev = None
@@ -99,14 +109,26 @@ class RecoveryMonitor:
         (default 5 s — the design's "±2% for ≥5 consecutive seconds").
     """
 
-    def __init__(self, r0, tol: float, scan_hz: int, hold_s: float = 5.0):
+    def __init__(self, r0, tol: float, scan_hz: int, hold_s: float = 5.0, ema_alpha=None):
         self.r0 = np.asarray(r0, dtype=np.float64)
         self.tol = float(tol)
         self.hold_frames = max(1, round(float(hold_s) * scan_hz))
         self.hold_s = float(hold_s)
         self.scan_hz = int(scan_hz)
+        self.ema_alpha = None if ema_alpha is None else float(ema_alpha)
+        self._ema = None
         self._within_count = 0     # consecutive frames within tolerance
         self._recovered = False    # latched once the hold is met
+
+    def _smooth(self, rs):
+        """EMA-smooth Rs (if enabled) so per-frame noise doesn't reset the hold."""
+        if self.ema_alpha is None:
+            return rs
+        self._ema = (
+            rs.copy() if self._ema is None
+            else self.ema_alpha * rs + (1.0 - self.ema_alpha) * self._ema
+        )
+        return self._ema
 
     def update(self, rs) -> dict:
         """Feed one live ``Rs`` vector ``(N,)``; return a status dict.
@@ -120,7 +142,7 @@ class RecoveryMonitor:
         * ``recovered``    — the hold has been met (latched True thereafter).
         * ``just_recovered`` — True on the single frame recovery is first reached.
         """
-        rs = np.asarray(rs, dtype=np.float64)
+        rs = self._smooth(np.asarray(rs, dtype=np.float64))
         # Ignore non-finite channels (open/rail) so one dead channel can't block
         # or falsely satisfy recovery; require at least one finite channel.
         ratio = rs / self.r0

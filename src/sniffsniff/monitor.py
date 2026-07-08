@@ -56,14 +56,19 @@ class MonitorEngine:
         recorder: SniffRecorder,
         *,
         hold_s: float = 5.0,
-        settle_hold_s: float = 3.0,
-        settle_max_wait_s: float = 30.0,
+        settle_hold_s=None,
+        settle_max_wait_s=None,
+        smooth_alpha=None,
     ):
         self.config = config
         self.recorder = recorder
         self.hold_s = hold_s
-        self.settle_hold_s = settle_hold_s
-        self.settle_max_wait_s = settle_max_wait_s
+        # Adaptive-capture tuning defaults come from config; constructor overrides win.
+        self.settle_hold_s = config.settle_hold_s if settle_hold_s is None else settle_hold_s
+        self.settle_max_wait_s = (
+            config.settle_max_wait_s if settle_max_wait_s is None else settle_max_wait_s
+        )
+        self.smooth_alpha = config.smooth_alpha if smooth_alpha is None else smooth_alpha
         self.n = session_frame_count(config)
         self._slices = phase_slices(self.n, config)
 
@@ -139,6 +144,7 @@ class MonitorEngine:
             self._stability = StabilityMonitor(
                 self.config.recover_tol, self.config.scan_hz,
                 hold_s=self.settle_hold_s, max_wait_s=self.settle_max_wait_s,
+                ema_alpha=self.smooth_alpha,
             )
 
         if self._settling:
@@ -172,7 +178,7 @@ class MonitorEngine:
                 event["saved"] = (result, path)
                 self._recovery = RecoveryMonitor(
                     result.r0, self.config.recover_tol, self.config.scan_hz,
-                    hold_s=self.hold_s,
+                    hold_s=self.hold_s, ema_alpha=self.smooth_alpha,
                 )
                 self._capturing = False
         elif self._recovery is not None:
