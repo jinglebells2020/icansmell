@@ -115,11 +115,13 @@ class SerialReader:
         n_channels: int = 6,
         reconnect: bool = True,
         opener: Optional[Callable[[], object]] = None,
+        startup_delay_s: float = 0.0,
     ) -> None:
         self.port = port
         self.baud = baud
         self.n_channels = n_channels
         self.reconnect = reconnect
+        self.startup_delay_s = float(startup_delay_s)
         self._opener = opener if opener is not None else _default_opener(port, baud)
         self._serial: Optional[object] = None  # opened lazily in frames()
 
@@ -137,6 +139,11 @@ class SerialReader:
         while True:
             if self._serial is None:
                 self._serial = self._opener()
+                # Opening the port toggles DTR, which RESETS an Arduino; it then
+                # needs ~1-2 s to boot before it streams. Wait it out so the first
+                # reads don't hit the silent boot gap (and give up).
+                if self.startup_delay_s:
+                    time.sleep(self.startup_delay_s)
             try:
                 for line in self._iter_lines(self._serial):
                     frame = parse_line(line, self.n_channels)

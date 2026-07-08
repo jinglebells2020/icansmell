@@ -83,8 +83,12 @@ class SniffController:
             return SimulatedReader(frames)
         # reconnect=False: a bounded capture must NOT loop forever on a present-but-
         # silent device (readline timing out to b"") — it ends and we report no data.
+        # startup_delay: opening the port resets the Uno; wait for it to boot+stream.
         return SerialReader(
-            self.port, n_channels=self.config.n_channels, reconnect=False
+            self.port,
+            n_channels=self.config.n_channels,
+            reconnect=False,
+            startup_delay_s=2.5,
         )
 
     # ---------------------------------------------------------------- record

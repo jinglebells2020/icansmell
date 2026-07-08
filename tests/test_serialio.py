@@ -288,3 +288,19 @@ def test_serial_reader_reconnects_after_eof_when_enabled(monkeypatch):
     assert [t for t, _ in frames] == [1, 2, 3]      # frames span three reconnects
     assert opened["n"] == 3                          # reopened after each EOF
     assert serials[0].closed and serials[1].closed   # stale handles were closed
+
+
+def test_serial_reader_startup_delay_waits_after_open(monkeypatch):
+    """Opening resets the Uno; the reader must wait startup_delay_s before reading
+    so the first reads don't land in the silent boot gap."""
+    from sniffsniff import serialio
+
+    slept = []
+    monkeypatch.setattr(serialio.time, "sleep", lambda s: slept.append(s))
+    reader = SerialReader(
+        "x", n_channels=6, reconnect=False, startup_delay_s=2.5,
+        opener=lambda: FakeSerial([b"1,1,2,3,4,5,6\n"]),
+    )
+    frames = list(reader.frames())
+    assert 2.5 in slept                       # waited for the board to boot
+    assert frames and frames[0][0] == 1       # then read normally

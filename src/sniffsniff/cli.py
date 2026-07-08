@@ -108,8 +108,10 @@ def _make_reader(args, cfg: Config, *, seed: int | None = None):
     from .serialio import SerialReader
 
     # reconnect=False so a bounded capture ends on a silent/absent device instead
-    # of looping forever waiting for a frame that never comes.
-    return SerialReader(args.port, n_channels=cfg.n_channels, reconnect=False)
+    # of looping forever; startup_delay lets the Uno boot after the open-reset.
+    return SerialReader(
+        args.port, n_channels=cfg.n_channels, reconnect=False, startup_delay_s=2.5
+    )
 
 
 def _cmd_stream(args) -> int:
