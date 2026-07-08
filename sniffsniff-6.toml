@@ -1,0 +1,47 @@
+# sniffsniff — single-Uno 6-sensor rig (returned from the dual-board setup)
+#
+# One Arduino Uno on usbmodem101. Wiring: A0 and A4 swapped vs the old Uno-1
+# layout; A1/A2/A3/A5 unchanged. Servo left OFF (manual airflow) for now.
+# The dual-board rig still lives in sniffsniff.toml for later.
+
+[board]
+bits = 10
+vref = 5.0
+
+[array]
+vcc = 5.0
+
+[[array.board]]                       # single Uno — 6 sensors
+port = "/dev/cu.usbmodem101"
+channels = [
+  { ch = 0, sensor = "MQ4",   rl = 1000 },   # A0 — methane
+  { ch = 1, sensor = "MQ3",   rl = 1000 },   # A1 — alcohol / ethanol
+  { ch = 2, sensor = "MQ135", rl = 1000 },   # A2 — VOCs + ammonia
+  { ch = 3, sensor = "MQ7",   rl = 1000 },   # A3 — carbon monoxide
+  { ch = 4, sensor = "MQ2",   rl = 1000 },   # A4 — broad smoke / VOC
+  { ch = 5, sensor = "MQ8",   rl = 1000 },   # A5 — hydrogen
+]
+
+[timing]
+scan_hz     = 20
+baseline_s  = 15
+exposure_s  = 45
+purge_s     = 90
+plateau_s   = 10
+
+[features]
+ema_alphas = [0.1, 0.01, 0.001]
+
+[baseline]
+max_cv = 0.05
+recover_tol = 0.02
+
+# no [servo] driving — airflow is manual
+
+[capture]
+settle_hold_s = 3.0
+settle_max_wait_s = 30
+min_exposure_s = 15.0
+plateau_hold_s = 8.0
+plateau_eps = 0.005
+smooth_alpha = 0.2
