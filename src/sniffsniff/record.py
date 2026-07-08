@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,7 @@ __all__ = [
     "compute_rs_series",
     "compute_r0",
     "baseline_cv",
+    "noisy_channels",
     "phase_slices",
     "SniffResult",
     "SniffRecorder",
@@ -65,6 +67,17 @@ def baseline_cv(rs_baseline: np.ndarray) -> np.ndarray:
     mean = rs_baseline.mean(axis=0)
     std = rs_baseline.std(axis=0, ddof=0)
     return std / mean
+
+
+def noisy_channels(rs_baseline: np.ndarray, max_cv: float) -> np.ndarray:
+    """Boolean mask of channels whose baseline CV exceeds ``max_cv``.
+
+    Only *finite* CVs are compared: a non-finite CV (from an open/rail channel
+    with ``inf`` Rs) is a different fault and is left out of the noise mask.
+    ``rs_baseline`` is ``(T_b, N)``; returns ``(N,)`` bool.
+    """
+    cv = baseline_cv(rs_baseline)
+    return np.isfinite(cv) & (cv > float(max_cv))
 
 
 def phase_slices(n_frames: int, config: Config) -> dict:
@@ -155,7 +168,24 @@ class SniffRecorder:
         rs = compute_rs_series(raw, self.config)
 
         b_lo, b_hi = slices["baseline"]
-        r0 = compute_r0(rs[b_lo:b_hi])
+        rs_baseline = rs[b_lo:b_hi]
+        r0 = compute_r0(rs_baseline)
+
+        # Warn (don't fail) if the clean-air baseline is too noisy on any channel;
+        # the operator can re-baseline. Mirrors the spec's baseline-rejection rule.
+        noisy = noisy_channels(rs_baseline, self.config.max_cv)
+        if np.any(noisy):
+            cv = baseline_cv(rs_baseline)
+            names = self.config.sensor_names()
+            detail = ", ".join(
+                f"{names[i]} CV={cv[i]:.3f}" for i in np.nonzero(noisy)[0]
+            )
+            warnings.warn(
+                f"baseline too noisy on {int(noisy.sum())} channel(s) "
+                f"(CV > max_cv={self.config.max_cv}): {detail}. "
+                "Consider re-baselining in clean air.",
+                stacklevel=2,
+            )
 
         ratio = calibrate.rs_to_ratio(rs, r0)
         fractional = calibrate.ratio_to_fractional(ratio)

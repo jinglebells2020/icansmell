@@ -178,3 +178,23 @@ def test_extract_requires_three_alphas():
         extract_features(
             y, exposure=(2, 7), purge=(7, 12), plateau=(4, 7), ema_alphas=(0.1, 0.01)
         )
+
+
+# --- degenerate/truncated sessions (empty reduction windows) -----------------
+
+def test_extract_features_empty_exposure_raises():
+    y = np.zeros((10, 6))
+    with pytest.raises(ValueError, match="exposure window"):
+        extract_features(y, exposure=(5, 5), purge=(5, 8), plateau=(6, 8), ema_alphas=ALPHAS)
+
+
+def test_extract_features_empty_purge_raises():
+    y = np.zeros((10, 6))
+    with pytest.raises(ValueError, match="purge window"):
+        extract_features(y, exposure=(2, 6), purge=(6, 6), plateau=(4, 6), ema_alphas=ALPHAS)
+
+
+def test_extract_features_empty_plateau_raises():
+    y = np.zeros((10, 6))
+    with pytest.raises(ValueError, match="plateau window"):
+        extract_features(y, exposure=(2, 6), purge=(6, 9), plateau=(6, 6), ema_alphas=ALPHAS)

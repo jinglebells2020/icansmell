@@ -85,6 +85,24 @@ def extract_features(
     pur_lo, pur_hi = purge
     plat_lo, plat_hi = plateau
 
+    # Guard degenerate/truncated sessions: a reduction over an empty window is
+    # undefined. Fail fast with a clear message rather than an opaque numpy error.
+    if exp_hi <= exp_lo:
+        raise ValueError(
+            f"exposure window {exposure} is empty — session too short "
+            f"(T={T}) to extract features"
+        )
+    if pur_hi <= pur_lo:
+        raise ValueError(
+            f"purge window {purge} is empty — session too short "
+            f"(T={T}) to extract features"
+        )
+    if plat_hi <= plat_lo:
+        raise ValueError(
+            f"plateau window {plateau} is empty — session too short "
+            f"(T={T}) to extract features"
+        )
+
     # dy per column over the FULL curve: dy[0] = 0, dy[k] = y[k] - y[k-1].
     dy = np.zeros_like(y)
     dy[1:] = y[1:] - y[:-1]

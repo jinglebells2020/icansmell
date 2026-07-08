@@ -14,6 +14,7 @@ from sniffsniff.record import (
     baseline_cv,
     compute_r0,
     compute_rs_series,
+    noisy_channels,
     phase_slices,
 )
 from sniffsniff.simulator import Simulator
@@ -175,3 +176,77 @@ def test_recorder_channel_agnostic(tmp_path):
     rec = SniffRecorder(cfg3, tmp_path)
     result = rec.process(sim.sniff_frames("coffee"), "coffee")
     assert result.features.shape == (24,)
+
+
+# --- degenerate session, open-channel isolation, baseline-noise gating --------
+
+def _short_config():
+    """A small-timing config so hand-built sniffs are cheap (80 frames total)."""
+    return replace(
+        default_config(),
+        baseline_s=1.0, exposure_s=2.0, purge_s=1.0, plateau_s=0.5,
+    )
+
+
+def test_process_too_short_session_raises(tmp_path):
+    cfg = default_config()  # full timing; 50 frames can't fill the exposure window
+    frames = [(i * 50, np.full(6, 300, dtype=np.int64)) for i in range(50)]
+    rec = SniffRecorder(cfg, tmp_path)
+    with pytest.raises(ValueError, match="too short"):
+        rec.process(frames, "coffee")
+
+
+def test_open_channel_is_isolated_to_that_channel(tmp_path):
+    cfg = _short_config()
+    sim = Simulator(cfg, seed=1, noise_counts=1.0)
+    frames = [(t, raw.copy()) for t, raw in sim.sniff_frames("coffee")]
+    bad = 3
+    for _, raw in frames:
+        raw[bad] = 0  # rail low -> V_RL=0 -> Rs=inf -> nan features for this channel
+    rec = SniffRecorder(cfg, tmp_path)
+    with np.errstate(invalid="ignore"):  # inf/inf -> nan on the open channel is expected
+        result = rec.process(frames, "coffee")
+    feats = result.features.reshape(cfg.n_channels, 8)
+    assert np.all(~np.isfinite(feats[bad])), "open channel must be flagged (non-finite)"
+    good = [i for i in range(cfg.n_channels) if i != bad]
+    assert np.all(np.isfinite(feats[good])), "other channels must be unaffected"
+
+
+def test_noisy_channels_flags_high_cv():
+    # channel 0 steady (CV=0), channel 1 swings hard (CV~0.8)
+    rs = np.array(
+        [[40000.0, 10000.0],
+         [40000.0, 90000.0],
+         [40000.0, 10000.0],
+         [40000.0, 90000.0]]
+    )
+    mask = noisy_channels(rs, max_cv=0.05)
+    assert mask.tolist() == [False, True]
+
+
+def test_noisy_channels_ignores_open_channel_nan():
+    rs = np.array([[np.inf, 40000.0], [np.inf, 40000.0]])  # ch0 open -> CV nan
+    with np.errstate(invalid="ignore"):  # inf-inf -> nan while estimating std
+        mask = noisy_channels(rs, max_cv=0.05)
+    assert mask.tolist() == [False, False]  # nan CV is not "noisy"
+
+
+def test_process_warns_on_noisy_baseline(tmp_path):
+    cfg = replace(_short_config(), max_cv=1e-6)  # any real noise now exceeds max_cv
+    sim = Simulator(cfg, seed=2, noise_counts=5.0)
+    frames = sim.sniff_frames("coffee")
+    rec = SniffRecorder(cfg, tmp_path)
+    with pytest.warns(UserWarning, match="baseline too noisy"):
+        rec.process(frames, "coffee")
+
+
+def test_process_quiet_on_clean_baseline(tmp_path, recwarn):
+    # A perfectly noise-free baseline has CV=0 on every channel -> no warning.
+    # (With sim noise, high-Rs channels on a 1k RL sit at low ADC counts and can
+    #  legitimately exceed max_cv — that path is covered by the noisy test above.)
+    cfg = _short_config()  # default max_cv=0.05
+    sim = Simulator(cfg, seed=3, noise_counts=0.0)
+    frames = sim.sniff_frames("coffee")
+    rec = SniffRecorder(cfg, tmp_path)
+    rec.process(frames, "coffee")
+    assert not [w for w in recwarn.list if "baseline too noisy" in str(w.message)]

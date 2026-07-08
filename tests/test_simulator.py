@@ -219,3 +219,9 @@ def test_respects_config_n_channels():
     sim = Simulator(cfg, seed=0)
     frames = sim.sniff_frames("coffee")
     assert frames[0][1].shape == (3,)
+
+
+def test_tau_decay_slower_than_rise():
+    """Purge desorption must be slower than exposure adsorption (spec: tau_decay > tau_rise)."""
+    sim = Simulator(default_config(), seed=0)
+    assert sim.tau_decay > sim.tau_rise

@@ -260,3 +260,31 @@ def test_serial_reader_close_before_frames_is_safe():
     reader = SerialReader("PORTX", opener=lambda: FakeSerial([]))
     # No frames() call yet -> nothing opened; close() must not raise.
     reader.close()
+
+
+def test_serial_reader_reconnects_after_eof_when_enabled(monkeypatch):
+    """With reconnect=True, a clean EOF (b"") reopens the port and continues."""
+    import itertools
+    from sniffsniff import serialio
+
+    monkeypatch.setattr(serialio.time, "sleep", lambda _s: None)  # no real backoff wait
+
+    serials = [
+        FakeSerial([b"1,1,2,3,4,5,6\n"]),
+        FakeSerial([b"2,7,8,9,10,11,12\n"]),
+        FakeSerial([b"3,13,14,15,16,17,18\n"]),
+    ]
+    opened = {"n": 0}
+
+    def opener():
+        s = serials[opened["n"]]
+        opened["n"] += 1
+        return s
+
+    reader = SerialReader("ignored", n_channels=6, reconnect=True, opener=opener)
+    frames = list(itertools.islice(reader.frames(), 3))
+    reader.close()
+
+    assert [t for t, _ in frames] == [1, 2, 3]      # frames span three reconnects
+    assert opened["n"] == 3                          # reopened after each EOF
+    assert serials[0].closed and serials[1].closed   # stale handles were closed
