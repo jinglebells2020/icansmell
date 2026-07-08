@@ -93,10 +93,8 @@ def _cmd_stream(args) -> int:
     try:
         for t_ms, raw in reader.frames():
             rs = calibrate.counts_to_rs(raw, rl, cfg.vcc, cfg.vref, cfg.bits)
-            # Without a recorded R0, show the raw Rs-relative-to-first-frame view
-            # via the fractional chain assuming R0 == this frame's Rs is not
-            # meaningful; instead print counts-derived fractional vs a running
-            # baseline is out of scope for a smoke stream — show Rs directly.
+            # A smoke stream has no established R0 baseline, so fractional response
+            # isn't well-defined here — print the calibrated Rs (ohms) directly.
             cells = "  ".join(f"{v:8.1f}" for v in rs)
             print(f"{t_ms:6d}  {cells}")
             printed += 1
@@ -117,8 +115,8 @@ def _cmd_record(args) -> int:
         return 1
 
     rec = SniffRecorder(cfg, args.out)
-    path = rec.record(frames, args.label)
-    result = rec.process(frames, args.label)
+    result = rec.process(frames, args.label)  # compute once...
+    path = rec.save(result)                    # ...then persist
     print(f"recorded {args.label}: {path}")
     print(f"  samples={result.raw.shape[0]} features={result.features.shape[0]}")
     return 0
