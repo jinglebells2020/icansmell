@@ -80,6 +80,7 @@ class SniffApp(App):
         ("X", "clear", "Clear"),
         ("f", "fit", "Fit"),
         ("i", "identify", "Identify"),
+        ("t", "think", "Think"),
         ("m", "map", "Map"),
         ("s", "toggle_sim", "Sim/Real"),
         ("q", "quit", "Quit"),
@@ -94,6 +95,8 @@ class SniffApp(App):
         self.label = label or controller.known_labels()[0]
         self._busy = False  # a capture/fit/map is running — refuse a second
         self._clear_armed = False  # first X arms, second X within focus confirms
+        self._last_geometry = None  # geometry of the last identified sniff (for `t`)
+        self._last_verdict = None  # the last identify verdict dict (for `t`)
 
     # ------------------------------------------------------------- layout
     def compose(self) -> ComposeResult:
@@ -410,6 +413,9 @@ class SniffApp(App):
         except Exception as exc:
             self.call_from_thread(self._log, f"identify failed: {exc}")
         else:
+            # Stash for the `t` (think) action, which reasons over this geometry.
+            self._last_geometry = result["geometry"]
+            self._last_verdict = result
             self.call_from_thread(
                 self._log,
                 f"predicted {result['label']} "
@@ -419,6 +425,35 @@ class SniffApp(App):
         finally:
             self.call_from_thread(self._set_nose, "idle")
             self.call_from_thread(self._refresh_coach)
+            self.call_from_thread(self._clear_busy)
+
+    # ----------------------------------------------------------- think
+    def action_think(self) -> None:
+        self._disarm_clear()
+        if self._reject_if_busy():
+            return
+        if self._last_geometry is None:
+            self._log("think: identify a sniff first (press i)")
+            return
+        self._busy = True
+        self._log("thinking about the last sniff …")
+        self._think_worker()
+
+    @work(thread=True)
+    def _think_worker(self) -> None:
+        try:
+            from .. import llm
+            from ..reason import reason
+
+            client = llm.OpenRouterClient()
+            narrative = reason(self._last_geometry, client)
+        except Exception as exc:
+            # Includes LLMError (missing key hint) — never a traceback or a key.
+            self.call_from_thread(self._log, str(exc))
+        else:
+            for line in str(narrative).splitlines() or [str(narrative)]:
+                self.call_from_thread(self._log, line)
+        finally:
             self.call_from_thread(self._clear_busy)
 
     # ------------------------------------------------------------- map

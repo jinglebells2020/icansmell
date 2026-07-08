@@ -230,6 +230,94 @@ def test_coach_updates_after_record(tmp_path):
     asyncio.run(scenario())
 
 
+def _spy_log(app):
+    """Wrap ``app._log`` to also collect messages into a returned list."""
+    messages: list[str] = []
+    original = app._log
+
+    def logger(msg):
+        messages.append(msg)
+        original(msg)
+
+    app._log = logger
+    return messages
+
+
+def _train(pilot, app, ctrl):
+    """Record two labels and fit a model (shared by the think tests)."""
+
+    async def go():
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("f")
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    return go()
+
+
+def test_think_before_identify_logs_hint(tmp_path):
+    ctrl = _controller(tmp_path)
+    app = SniffApp(ctrl, reps=1, label="coffee")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            messages = _spy_log(app)
+            await pilot.press("t")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert any("identify" in m.lower() for m in messages)
+
+    asyncio.run(scenario())
+
+
+def test_think_logs_narrative_after_identify(tmp_path, monkeypatch):
+    ctrl = _controller(tmp_path)
+    app = SniffApp(ctrl, reps=1, label="coffee")
+
+    narrative = "Most likely coffee.\nWithin its cluster; not novel."
+
+    def fake_reason(geometry, client, **kwargs):
+        return narrative
+
+    # No network: the worker imports sniffsniff.reason; patch its reason fn.
+    monkeypatch.setattr("sniffsniff.reason.reason", fake_reason)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await _train(pilot, app, ctrl)
+            # Identify one sniff → stashes geometry.
+            await pilot.press("i")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app._last_geometry is not None
+
+            messages = _spy_log(app)
+            await pilot.press("t")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            joined = "\n".join(messages)
+            assert "Most likely coffee." in joined
+            assert "Within its cluster; not novel." in joined
+
+    asyncio.run(scenario())
+
+
 def test_guided_flow_end_to_end(tmp_path):
     """The full guided workflow: record two labels, fit, identify, delete."""
     ctrl = _controller(tmp_path)

@@ -302,6 +302,49 @@ def _cmd_identify(args) -> int:
     return 0
 
 
+def _cmd_reason(args) -> int:
+    """Capture/sim one sniff, build its geometry, and print an LLM narrative.
+
+    Reuses the TUI controller to capture one sniff and serialize the smell-space
+    geometry, then asks an OpenRouter model to interpret it. A missing model or a
+    missing ``OPENROUTER_API_KEY`` degrades to a friendly hint (return 1) — never
+    a traceback, and the key is never printed.
+    """
+    from . import llm
+    from .reason import reason
+    from .tui.controller import SniffController
+
+    cfg = _load(args.config)
+    ctrl = SniffController(
+        cfg,
+        out_dir="data",
+        use_sim=args.sim,
+        port=args.port,
+        seed=args.seed,
+        model_path=args.model,
+    )
+    if not ctrl.has_model():
+        print(
+            f"no model at {args.model} — fit one first "
+            "(e.g. sniffsniff fit --sim --out model.joblib)"
+        )
+        return 1
+
+    result = ctrl.identify(seed=args.seed)
+    print(
+        f"predicted: {result['label']}  (proba={result['proba']:.3f})  "
+        f"novelty={result['novelty']:.3f} (is_novel={result['is_novel']})"
+    )
+
+    try:
+        client = llm.OpenRouterClient(model=args.llm_model)
+        print(reason(result["geometry"], client))
+    except llm.LLMError as exc:
+        print(str(exc))
+        return 1
+    return 0
+
+
 def _cmd_tui(args) -> int:
     """Launch the interactive Textual TUI over a SniffController."""
     from .tui.controller import SniffController
@@ -391,6 +434,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_id.add_argument("--seed", type=int, default=0)
     p_id.add_argument("--json", action="store_true", help="also emit geometry JSON")
     p_id.set_defaults(func=_cmd_identify)
+
+    from .llm import DEFAULT_MODEL as _DEFAULT_LLM_MODEL
+
+    p_reason = sub.add_parser(
+        "reason", help="capture one sniff and have an LLM narrate its geometry"
+    )
+    p_reason.add_argument("--model", required=True, help="fitted model.joblib")
+    p_reason.add_argument("--sim", action="store_true", help="use the simulator")
+    p_reason.add_argument("--odor", default=None, help="odor to simulate for --sim")
+    p_reason.add_argument("--port", default="/dev/cu.usbmodem101", help="serial port")
+    p_reason.add_argument("--config", default=None, help="path to a config TOML")
+    p_reason.add_argument("--seed", type=int, default=0)
+    p_reason.add_argument(
+        "--llm-model", default=_DEFAULT_LLM_MODEL, help="OpenRouter model id"
+    )
+    p_reason.set_defaults(func=_cmd_reason)
 
     p_tui = sub.add_parser("tui", help="launch the interactive Textual console")
     p_tui.add_argument("--sim", action="store_true", help="use the simulator")
