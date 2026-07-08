@@ -112,7 +112,6 @@ class SniffApp(App):
         self._rep_label = None
         self._reps_remaining = 0
         self._rep_total = 0
-        self._servo_started = False     # sent the initial fresh-air command yet?
         # test hooks: inject a bounded frame source + disable real-time pacing
         self._source_factory = source_factory
         self._paced = paced
@@ -221,11 +220,18 @@ class SniffApp(App):
         from ..record import SniffRecorder
 
         self._monitor_stop = False
-        self._servo_started = False
         self._engine = MonitorEngine(
             self.controller.config, SniffRecorder(self.controller.config, self.controller.out_dir)
         )
         self._source = self._build_source()
+        # Let the engine drive the airflow straw per phase (fresh vs sample). In sim
+        # this is how the odor is presented; on hardware it needs a write-capable
+        # source and servo_enabled. Without it, the operator switches straws by hand.
+        cfg = self.controller.config
+        if hasattr(self._source, "write_command") and (
+            self.controller.use_sim or cfg.servo_enabled
+        ):
+            self._engine.set_airflow(self._source.write_command)
         self._monitor_worker()
 
     @work(thread=True, exclusive=True, group="monitor")
@@ -256,7 +262,6 @@ class SniffApp(App):
         phase = ev["phase"]
         self.query_one("#sensors", SensorBars).update_values(names, ev["rs"], phase)
         self._set_nose("sniffing" if phase == "exposure" else "idle")
-        self._drive_servo(ev)
 
         if ev["settle"] is not None:
             st = ev["settle"]
@@ -288,29 +293,6 @@ class SniffApp(App):
                     f"held {rec['held_s']:.1f}/{rec['target_s']:.0f}s"
                 )
 
-    def _drive_servo(self, ev: dict) -> None:
-        """On real hardware, switch the airflow servo to match the phase.
-
-        First frame → fresh-air (clean air over sensors); exposure → sample angle;
-        baseline/purge/monitor → fresh-air. No-op in sim or without a write-capable
-        source or with the servo disabled.
-        """
-        cfg = self.controller.config
-        if self.controller.use_sim or not cfg.servo_enabled:
-            return
-        src = self._source
-        if not hasattr(src, "write_command"):
-            return
-        if not self._servo_started:
-            src.write_command(f"S{cfg.servo_fresh_air_angle}")
-            self._servo_started = True
-        if ev["phase_changed"]:
-            angle = (
-                cfg.servo_sample_angle
-                if ev["phase"] == "exposure"
-                else cfg.servo_fresh_air_angle
-            )
-            src.write_command(f"S{angle}")
 
     def _on_capture_complete(self, saved) -> None:
         result, path = saved
@@ -447,8 +429,10 @@ class SniffApp(App):
             self._active_label = label
             idx = self._rep_total - self._reps_remaining + 1
             self._log(f"recording '{label}' {idx}/{self._rep_total} — follow the cues")
-            if self.controller.use_sim and hasattr(self._source, "begin_odor"):
-                self._source.begin_odor(label)
+            # sim: tell the source which odor its sample straw presents (the engine's
+            # airflow reveals it during exposure). Real hardware ignores this.
+            if self.controller.use_sim and hasattr(self._source, "set_odor"):
+                self._source.set_odor(label)
 
     # -------------------------------------------------------- identify
     def action_identify(self) -> None:
@@ -462,8 +446,8 @@ class SniffApp(App):
             self._identify_pending = True
             self._active_label = "?"
             self._log("identifying one sniff …")
-            if self.controller.use_sim and hasattr(self._source, "begin_odor"):
-                self._source.begin_odor(self.label)
+            if self.controller.use_sim and hasattr(self._source, "set_odor"):
+                self._source.set_odor(self.label)
 
     # ----------------------------------------------------- delete / clear
     def action_delete_last(self) -> None:

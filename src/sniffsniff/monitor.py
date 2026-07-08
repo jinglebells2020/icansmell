@@ -12,21 +12,29 @@ frame via :meth:`step` and it returns an event dict. It owns no threads and no U
 so it is fully deterministic to test; a caller (the TUI worker) pulls frames from a
 source, calls ``step``, and renders the events.
 
-:class:`ContinuousSim` is a frame source for ``--sim`` mode: it streams clean-air
-frames while idle and the requested odor's session during a capture window, so the
-same engine drives both simulator and real hardware.
+:class:`ContinuousSim` is a servo-driven frame source for ``--sim`` mode: it streams
+a continuously-relaxing array that responds to airflow commands (``S<angle>``) just
+like the real device, so the *same* engine — including its dynamic, plateau-gated
+exposure and its airflow driving — behaves identically on simulator and hardware.
 """
 from __future__ import annotations
 
 import numpy as np
 
 from . import calibrate
-from .capture import phase_of, session_frame_count
-from .record import SniffRecorder, phase_slices
+from .record import SniffRecorder
 from .recovery import RecoveryMonitor, StabilityMonitor
-from .simulator import Simulator
+from .simulator import ODOR_PROFILES
 
 __all__ = ["MonitorEngine", "ContinuousSim"]
+
+
+def _odor_gain(config, label: str) -> np.ndarray:
+    """Per-channel odor gain ``(N,)`` for ``label`` (0 for clean air / unknown)."""
+    profile = ODOR_PROFILES.get(label, {})
+    return np.array(
+        [profile.get(name, 0.0) for name in config.sensor_names()], dtype=np.float64
+    )
 
 
 def _rs_of(raw, config) -> np.ndarray:
@@ -58,6 +66,7 @@ class MonitorEngine:
         hold_s: float = 5.0,
         settle_hold_s=None,
         settle_max_wait_s=None,
+        plateau_hold_s=None,
         smooth_alpha=None,
     ):
         self.config = config
@@ -68,9 +77,16 @@ class MonitorEngine:
         self.settle_max_wait_s = (
             config.settle_max_wait_s if settle_max_wait_s is None else settle_max_wait_s
         )
+        self.plateau_hold_s = (
+            config.plateau_hold_s if plateau_hold_s is None else plateau_hold_s
+        )
         self.smooth_alpha = config.smooth_alpha if smooth_alpha is None else smooth_alpha
-        self.n = session_frame_count(config)
-        self._slices = phase_slices(self.n, config)
+        # Fixed baseline & purge lengths; exposure is DYNAMIC (baseline..plateau/cap).
+        hz = config.scan_hz
+        self.n_base = max(1, round(config.baseline_s * hz))
+        self.n_exp_max = max(1, round(config.exposure_s * hz))   # exposure cap
+        self.n_purge = max(1, round(config.purge_s * hz))
+        self.n_plateau = max(1, round(config.plateau_s * hz))    # trailing feature window
 
         self._pending_label: str | None = None
         self._pending_save = True
@@ -80,9 +96,56 @@ class MonitorEngine:
         self._capturing = False
         self._label: str | None = None
         self._buf: list = []
-        self._i = 0
         self._phase: str | None = None
         self._recovery: RecoveryMonitor | None = None
+        # per-capture dynamic-exposure state (reset when a capture begins)
+        self._plateau: StabilityMonitor | None = None
+        self._exp_end: int | None = None
+        self._r0_est: np.ndarray | None = None
+        self._responded = False
+        # optional airflow sink the engine drives per phase (fresh vs sample straw)
+        self._airflow = None
+
+    @property
+    def n(self) -> int:
+        """Upper-bound frames for one full capture (baseline + exposure cap + purge).
+
+        Exposure is dynamic, so a real capture is usually *shorter* than this; ``n``
+        is the ceiling used for progress display and as a settle-independent cap.
+        """
+        return self.n_base + self.n_exp_max + self.n_purge
+
+    def set_airflow(self, fn) -> None:
+        """Wire a servo-command sink ``fn("S<angle>")`` that the engine drives per phase.
+
+        Called immediately with the fresh-air angle so the rig starts in clean air;
+        thereafter the engine sends the sample angle for exposure and the fresh-air
+        angle for baseline/purge. ``fn=None`` disables airflow driving (manual rig).
+        """
+        self._airflow = fn
+        if fn is not None:
+            fn(f"S{self.config.servo_fresh_air_angle}")
+
+    def _command_airflow(self, phase: str) -> None:
+        if self._airflow is None:
+            return
+        angle = (
+            self.config.servo_sample_angle
+            if phase == "exposure"
+            else self.config.servo_fresh_air_angle
+        )
+        self._airflow(f"S{angle}")
+
+    def _dynamic_slices(self, exp_end: int, total: int) -> dict:
+        """Half-open phase slices for a capture whose exposure ended at ``exp_end``."""
+        n_base = self.n_base
+        plat_start = max(n_base, exp_end - self.n_plateau)
+        return {
+            "baseline": (0, n_base),
+            "exposure": (n_base, exp_end),
+            "purge": (exp_end, total),
+            "plateau": (plat_start, exp_end),
+        }
 
     # -------------------------------------------------------- control
     @property
@@ -155,25 +218,62 @@ class MonitorEngine:
                 event["phase_changed"] = True
                 self._phase = "settle"
             if st["settled"]:
-                # sensors are at rest — begin the timed capture on the next frame
+                # sensors are at rest — begin the windowed capture on the next frame
                 self._settling = False
                 self._capturing = True
                 self._buf = []
-                self._i = 0
                 self._phase = None
+                self._plateau = None
+                self._exp_end = None
+                self._r0_est = None
+                self._responded = False
             return event
 
         if self._capturing:
             self._buf.append(frame)
-            phase = phase_of(self._i, self._slices)
+            n_so_far = len(self._buf)
+
+            if n_so_far <= self.n_base:
+                phase = "baseline"                       # fixed-length clean-air window
+            elif self._exp_end is None:
+                phase = "exposure"                       # dynamic — hold until plateau
+                if self._plateau is None:
+                    # entering exposure: fix R0 from the baseline window and start the
+                    # plateau detector (no max_wait — the exposure cap bounds it).
+                    base = np.array(
+                        [_rs_of(f[1], self.config) for f in self._buf[: self.n_base]]
+                    )
+                    self._r0_est = base.mean(axis=0)
+                    self._plateau = StabilityMonitor(
+                        self.config.recover_tol, self.config.scan_hz,
+                        hold_s=self.plateau_hold_s, max_wait_s=None,
+                        ema_alpha=self.smooth_alpha,
+                    )
+                # only let the plateau gate fire once the response has actually moved
+                # off baseline — otherwise the still-flat first frames look "plateaued".
+                if not self._responded:
+                    dev = np.abs(rs / self._r0_est - 1.0)
+                    finite = np.isfinite(dev)
+                    if finite.any() and float(dev[finite].max()) > self.config.recover_tol:
+                        self._responded = True
+                st = self._plateau.update(rs)
+                exp_len = n_so_far - self.n_base
+                if (st["stable"] and self._responded) or exp_len >= self.n_exp_max:
+                    self._exp_end = n_so_far             # this frame is the last exposure frame
+            else:
+                phase = "purge"                          # fixed-length recovery window
+
             event["phase"] = phase
-            event["capture"] = (self._i + 1, self.n)
+            total = (self._exp_end + self.n_purge) if self._exp_end is not None else self.n
+            event["capture"] = (n_so_far, total)
             if phase != self._phase:
                 event["phase_changed"] = True
                 self._phase = phase
-            self._i += 1
-            if self._i >= self.n:
-                result = self.recorder.process(self._buf, self._label)
+                self._command_airflow(phase)             # fresh vs sample straw
+
+            if self._exp_end is not None and n_so_far >= self._exp_end + self.n_purge:
+                slices = self._dynamic_slices(self._exp_end, n_so_far)
+                result = self.recorder.process(self._buf, self._label, slices=slices)
                 path = self.recorder.save(result) if self._save else None
                 event["saved"] = (result, path)
                 self._recovery = RecoveryMonitor(
@@ -188,49 +288,78 @@ class MonitorEngine:
 
 
 class ContinuousSim:
-    """A never-ending simulated frame source for the monitoring engine.
+    """A servo-driven continuous airflow simulator — a drop-in frame source.
 
-    Streams clean-air frames while idle; when :meth:`begin_odor` is called it emits
-    exactly one odor session (``session_frame_count`` frames) then reverts to clean
-    air. ``t_ms`` advances monotonically. Mirrors a real device that streams
-    continuously while airflow (servo/operator) decides what the sensors smell.
+    Models a continuously-relaxing sensor array whose airflow is chosen by the
+    servo, exactly like real hardware: at the SAMPLE angle the resistances relax
+    toward the current odor's target (rise time constant ``tau_rise``); at the
+    FRESH angle they relax back toward clean air (``tau_decay``). This lets the
+    engine's *dynamic* exposure (hold until plateau) behave identically in sim and
+    on hardware.
+
+    Drive it with :meth:`write_command` (``"S<angle>"`` — the same command the app
+    sends the device) and :meth:`set_odor` to choose which odor the sample presents.
     """
 
-    def __init__(self, config, seed: int = 0, noise_counts: float = 1.0):
+    def __init__(self, config, seed: int = 0, noise_counts: float = 1.0,
+                 r_base=None, tau_rise: float = 5.0, tau_decay: float = 20.0):
         self.config = config
-        self._seed = seed
+        n = config.n_channels
+        self.r_base = (
+            np.asarray(r_base, dtype=np.float64)
+            if r_base is not None
+            else np.linspace(20000.0, 60000.0, n)
+        )
+        self.tau_rise = float(tau_rise)
+        self.tau_decay = float(tau_decay)
+        self.noise = float(noise_counts)
+        self._rng = np.random.default_rng(seed)
+        self._dt = 1.0 / config.scan_hz
         self._step_ms = round(1000 / config.scan_hz)
         self._t = 0
-        # A clean-air session we cycle through for the idle stream.
-        self._clean = Simulator(config, seed=seed, noise_counts=noise_counts).sniff_frames(
-            "clean_air"
-        )
-        self._clean_i = 0
-        self._noise = noise_counts
-        self._odor: list | None = None
-        self._odor_i = 0
+        self._rs = self.r_base.copy()          # current resistance state
+        self._odor: str | None = None
+        self._at_sample = False
+        self._sample_angle = config.servo_sample_angle
+        self._target = self.r_base.copy()
 
-    def begin_odor(self, label: str, seed: int | None = None) -> None:
-        """Emit ``label``'s odor session over the next reads, then revert to clean."""
-        s = self._seed if seed is None else seed
-        self._odor = Simulator(self.config, seed=s, noise_counts=self._noise).sniff_frames(
-            label
-        )
-        self._odor_i = 0
+    def set_odor(self, label) -> None:
+        """Choose the odor presented while airflow is at the sample angle."""
+        self._odor = label
+        self._retarget()
+
+    def write_command(self, text) -> bool:
+        """React to an ``S<angle>`` airflow command (sample angle → present odor)."""
+        try:
+            angle = int(str(text).strip().lstrip("Ss").strip())
+        except (ValueError, TypeError):
+            return False
+        self._at_sample = angle == self._sample_angle
+        self._retarget()
+        return True
+
+    def _retarget(self) -> None:
+        if self._at_sample and self._odor:
+            gain = _odor_gain(self.config, self._odor)
+            self._target = self.r_base / (1.0 + gain)  # reducing gas drops Rs
+        else:
+            self._target = self.r_base
 
     def read(self) -> tuple[int, np.ndarray]:
-        """Return the next ``(t_ms, raw)`` frame (never ends)."""
-        if self._odor is not None:
-            raw = self._odor[self._odor_i][1]
-            self._odor_i += 1
-            if self._odor_i >= len(self._odor):
-                self._odor = None
-        else:
-            raw = self._clean[self._clean_i][1]
-            self._clean_i = (self._clean_i + 1) % len(self._clean)
+        """Advance the relaxation one frame and return ``(t_ms, raw counts)``."""
+        tau = self.tau_rise if self._at_sample else self.tau_decay
+        alpha = 1.0 - np.exp(-self._dt / tau)
+        self._rs = self._rs + (self._target - self._rs) * alpha
+        rl = self.config.rl_array()
+        v_rl = rl * self.config.vcc / (self._rs + rl)  # invert Rs -> V_RL
+        full_scale = float(2 ** self.config.bits - 1)
+        counts = v_rl * full_scale / self.config.vref
+        if self.noise > 0.0:
+            counts = counts + self._rng.normal(0.0, self.noise, size=counts.shape)
+        counts = np.clip(np.rint(counts), 0, full_scale).astype(np.int64)
         t = self._t
         self._t += self._step_ms
-        return (t, raw)
+        return (t, counts)
 
     def frames(self):
         """Endless iterator over :meth:`read` (interface parity with readers)."""

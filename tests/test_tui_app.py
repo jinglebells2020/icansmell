@@ -39,7 +39,7 @@ class _Silent:
     def close(self):
         pass
 
-    def begin_odor(self, label, seed=None):
+    def set_odor(self, label):
         pass
 
 
@@ -58,25 +58,26 @@ def _app(tmp_path, **kw):
 
 
 def _drive_capture(app, label, *, save=True, seed=0, odor=None):
-    """Run one capture (SETTLE → baseline → exposure → purge) through app._engine +
-    the UI handler; return the sim source (so callers can keep stepping idle frames)."""
+    """Run one capture (SETTLE → baseline → dynamic exposure → purge) through
+    app._engine + the UI handler; return the sim source (so callers can keep stepping
+    idle frames). The engine drives the sim's airflow, so the odor appears during
+    exposure exactly like real hardware."""
     names = app.controller.config.sensor_names()
     app._engine.settle_hold_s = 0.25       # fast, deterministic settle for tests
     app._engine.settle_max_wait_s = 2.0
     if not save:
         app._identify_pending = True
+    sim = ContinuousSim(app.controller.config, seed=seed, noise_counts=0.0)
+    sim.set_odor(odor or (label if label != "?" else "coffee"))
+    app._engine.set_airflow(sim.write_command)   # engine drives THIS sim's airflow
     app._engine.arm_capture(label, save=save)
     app._active_label = label
-    sim = ContinuousSim(app.controller.config, seed=seed, noise_counts=0.0)
-    # 1) settle on clean frames until the engine begins the timed capture
-    for _ in range(2000):
-        app._on_engine_event(app._engine.step(sim.read()), names)
-        if app._engine.capturing:
+    # settle, then window the capture; exposure length is dynamic, so step until saved
+    for _ in range(20000):
+        ev = app._engine.step(sim.read())
+        app._on_engine_event(ev, names)
+        if ev["saved"] is not None:
             break
-    # 2) present the odor and window the capture
-    sim.begin_odor(odor or (label if label != "?" else "coffee"), seed=seed)
-    for _ in range(app._engine.n):
-        app._on_engine_event(app._engine.step(sim.read()), names)
     return sim
 
 
@@ -404,11 +405,11 @@ def test_servo_driven_on_phase_transitions(tmp_path):
             app._active_label = app._rep_label = "coffee"
             app._rep_total = app._reps_remaining = 1
             sim = ContinuousSim(cfg, seed=0, noise_counts=0.0)
+            sim.set_odor("coffee")
             _settle_app(app, sim, names)   # servo holds fresh air during settle
-            sim.begin_odor("coffee")
             for _ in range(app._engine.n):
                 app._on_engine_event(app._engine.step(sim.read()), names)
-            assert src.cmds[0] == "S0"     # settle / baseline -> fresh air (0°)
+            assert src.cmds[0] == "S0"     # startup / baseline -> fresh air (0°)
             assert "S105" in src.cmds      # exposure -> sample (105°)
             assert src.cmds[-1] == "S0"    # purge -> fresh air (0°)
 
@@ -425,9 +426,9 @@ def test_sim_does_not_drive_a_servo(tmp_path):
             names = app.controller.config.sensor_names()
             # a silent source has no write_command; driving frames must not error
             sim = ContinuousSim(app.controller.config, seed=0, noise_counts=0.0)
+            sim.set_odor("coffee")
             app._engine.arm_capture("coffee")
             _settle_app(app, sim, names)
-            sim.begin_odor("coffee")
             for _ in range(app._engine.n):
                 app._on_engine_event(app._engine.step(sim.read()), names)
             # nothing to assert about a servo; the point is no crash + a sniff saved
@@ -450,9 +451,9 @@ def test_auto_reps_settle_gated(tmp_path):
             app._engine.arm_capture("coffee", save=True)
             app._active_label = "coffee"
             sim = ContinuousSim(cfg, seed=0, noise_counts=0.0)
+            sim.set_odor("coffee")
             # rep 1: settle then capture
             _settle_app(app, sim, names)
-            sim.begin_odor("coffee")
             for _ in range(app._engine.n):
                 app._on_engine_event(app._engine.step(sim.read()), names)
             assert app._reps_remaining == 1
@@ -462,7 +463,6 @@ def test_auto_reps_settle_gated(tmp_path):
                 app._on_engine_event(app._engine.step(sim.read()), names)
                 if app._engine.capturing:
                     break
-            sim.begin_odor("coffee")
             for _ in range(app._engine.n):
                 app._on_engine_event(app._engine.step(sim.read()), names)
             assert app._reps_remaining == 0

@@ -145,13 +145,16 @@ class SniffRecorder:
         self.out_dir = Path(out_dir)
 
     # -- computation (no side effects) ------------------------------------
-    def process(self, frames: list[tuple[int, np.ndarray]], label: str) -> SniffResult:
+    def process(
+        self, frames: list[tuple[int, np.ndarray]], label: str, slices: dict | None = None
+    ) -> SniffResult:
         """Compute the full calibrated result for a sniff (no disk writes).
 
-        Splits the session via :func:`phase_slices`, computes the Rs series,
-        derives R0 from the baseline window, forms the fractional curve
-        ``rs/R0 - 1`` over the whole series, and extracts the ``N*8``-D feature
-        vector using the phase slices.
+        Splits the session into phases (via ``slices`` if given — e.g. the monitor
+        engine's *dynamic* exposure boundary — else :func:`phase_slices` from the
+        fixed config timing), computes the Rs series, derives R0 from the baseline
+        window, forms the fractional curve ``rs/R0 - 1``, and extracts the
+        ``N*8``-D feature vector using those phase slices.
         """
         if not frames:
             raise ValueError("cannot process an empty frame list")
@@ -165,7 +168,8 @@ class SniffRecorder:
             )
 
         n_frames = raw.shape[0]
-        slices = phase_slices(n_frames, self.config)
+        if slices is None:
+            slices = phase_slices(n_frames, self.config)
 
         rs = compute_rs_series(raw, self.config)
 

@@ -49,7 +49,8 @@ class StabilityMonitor:
         self.hold_s = float(hold_s)
         self.win = max(1, round(hold_s * scan_hz))
         self.max_wait = None if max_wait_s is None else max(1, round(max_wait_s * scan_hz))
-        self.ema_alpha = None if ema_alpha is None else float(ema_alpha)
+        # 0 (or None) means "no smoothing" — matches the config's `smooth_alpha` note.
+        self.ema_alpha = float(ema_alpha) if ema_alpha else None
         self._ema = None
         self._buf: deque = deque(maxlen=self.win)
         self._count = 0
@@ -115,7 +116,8 @@ class RecoveryMonitor:
         self.hold_frames = max(1, round(float(hold_s) * scan_hz))
         self.hold_s = float(hold_s)
         self.scan_hz = int(scan_hz)
-        self.ema_alpha = None if ema_alpha is None else float(ema_alpha)
+        # 0 (or None) means "no smoothing" — matches the config's `smooth_alpha` note.
+        self.ema_alpha = float(ema_alpha) if ema_alpha else None
         self._ema = None
         self._within_count = 0     # consecutive frames within tolerance
         self._recovered = False    # latched once the hold is met
