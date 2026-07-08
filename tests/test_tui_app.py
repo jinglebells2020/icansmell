@@ -292,6 +292,30 @@ def test_next_prev_label_changes_current(tmp_path):
     asyncio.run(scenario())
 
 
+def test_arrow_keys_navigate_labels(tmp_path):
+    """↑/↓ (and ←/→) move the label selection — the intuitive control on a list.
+    The log is non-focusable so it can't swallow the arrows to scroll itself."""
+    _, app = _app(tmp_path, label="coffee")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            start = app.label
+            await pilot.press("down")
+            await pilot.pause()
+            assert app.label != start
+            after_down = app.label
+            await pilot.press("up")
+            await pilot.pause()
+            assert app.label == start
+            # left/right are aliases for prev/next
+            await pilot.press("right")
+            await pilot.pause()
+            assert app.label == after_down
+
+    asyncio.run(scenario())
+
+
 def test_plus_minus_changes_reps(tmp_path):
     _, app = _app(tmp_path, reps=2)
 

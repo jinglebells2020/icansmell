@@ -16,6 +16,7 @@ import time
 
 from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Input, Label
@@ -82,8 +83,13 @@ class SniffApp(App):
 
     BINDINGS = [
         ("r", "record", "Rec"),
-        ("n", "next_label", "Next label"),
-        ("p", "prev_label", "Prev label"),
+        # Arrow keys navigate the label list (↑/↓ or ←/→); n/p kept as aliases.
+        Binding("up", "prev_label", "label"),
+        Binding("down", "next_label", "label"),
+        Binding("left", "prev_label", "Prev label", show=False),
+        Binding("right", "next_label", "Next label", show=False),
+        Binding("n", "next_label", "Next label", show=False),
+        Binding("p", "prev_label", "Prev label", show=False),
         ("a", "add_label", "Add label"),
         ("plus", "more_reps", "+reps"),
         ("minus", "fewer_reps", "-reps"),

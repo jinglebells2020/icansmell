@@ -235,7 +235,7 @@ def render_header(
         "recovering": "blue",
         "idle": "grey50",
     }.get(phase_label, "cyan")
-    brand = "👃 [b]sniffsniff[/][grey50] · e-nose[/]"
+    brand = "[b]sniffsniff[/][grey50] · e-nose[/]"
     pills = (
         f"[{src_colour}]● {src}[/]    "
         f"[{model_colour}]{model_txt}[/]    "
@@ -423,6 +423,10 @@ try:  # textual is an optional extra; render helpers above import without it.
 
     class LogPanel(RichLog):
         """A scrolling event log."""
+
+        # Never take keyboard focus: the arrow keys belong to label navigation,
+        # and a focused RichLog would swallow them to scroll itself instead.
+        can_focus = False
 
         def __init__(self, *args, max_lines: int = 200, **kwargs) -> None:
             kwargs.setdefault("max_lines", max_lines)
