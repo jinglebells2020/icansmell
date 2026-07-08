@@ -32,15 +32,38 @@ def _load(config_path: str | None) -> Config:
     return default_config()
 
 
-def _collect_frames(reader) -> list[tuple[int, np.ndarray]]:
-    """Drain a reader's ``frames()`` iterator into a list, closing it after."""
-    frames = []
-    try:
-        for frame in reader.frames():
-            frames.append(frame)
-    finally:
-        reader.close()
-    return frames
+# Operator cues printed at each phase transition during a guided capture.
+_PHASE_CUES = {
+    "baseline": "🫧  BASELINE — hold CLEAN AIR (measuring R0)",
+    "exposure": "👃  PRESENT THE SAMPLE now",
+    "purge": "🌬   REMOVE the sample — purging back to clean air",
+}
+
+
+def _phase_cue(phase: str, k: int, n: int) -> None:
+    """Print the big operator cue when a capture crosses into a new phase."""
+    print(f"\n  {_PHASE_CUES.get(phase, phase)}")
+
+
+def _make_ticker(cfg: Config):
+    """A per-frame callback that prints a once-per-second elapsed/total line."""
+    hz = max(1, cfg.scan_hz)
+
+    def tick(k: int, n: int, phase: str) -> None:
+        if k % hz == 0:
+            print(f"\r    [{k // hz:3d}s / {n // hz:3d}s]  {phase:8s}", end="", flush=True)
+
+    return tick
+
+
+def _recover_countdown(seconds: int) -> None:
+    """Between reps: a clean-air recovery countdown (real capture only)."""
+    import time
+
+    for s in range(seconds, 0, -1):
+        print(f"\r  recover — hold clean air, next sniff in {s:2d}s ", end="", flush=True)
+        time.sleep(1)
+    print()
 
 
 def _cmd_simulate(args) -> int:
@@ -72,11 +95,15 @@ def _cmd_simulate(args) -> int:
     return 0
 
 
-def _make_reader(args, cfg: Config):
-    """Build the frame source: simulator when ``--sim``, else a real serial port."""
+def _make_reader(args, cfg: Config, *, seed: int | None = None):
+    """Build the frame source: simulator when ``--sim``, else a real serial port.
+
+    ``seed`` overrides ``args.seed`` for the simulator path (used to vary reps).
+    """
     if args.sim:
+        s = args.seed if seed is None else seed
         odor = getattr(args, "odor", None) or "coffee"
-        frames = Simulator(cfg, seed=args.seed).sniff_frames(odor)
+        frames = Simulator(cfg, seed=s).sniff_frames(odor)
         return SimulatedReader(frames)
     from .serialio import SerialReader
 
@@ -109,19 +136,47 @@ def _cmd_stream(args) -> int:
 
 
 def _cmd_record(args) -> int:
-    """Capture one sniff from the source and persist it under ``--out``."""
-    cfg = _load(args.config)
-    reader = _make_reader(args, cfg)
-    frames = _collect_frames(reader)
-    if not frames:
-        print("no frames captured; nothing recorded")
-        return 1
+    """Capture ``--reps`` guided sniffs from the source and persist them.
 
+    Each sniff is a bounded capture of exactly one baseline→exposure→purge session
+    (so a live serial stream is captured then stopped, never drained forever). The
+    operator is cued at each phase transition; between reps on real hardware a
+    recovery countdown lets the sensors return to baseline.
+    """
+    from .capture import capture_session
+
+    cfg = _load(args.config)
     rec = SniffRecorder(cfg, args.out)
-    result = rec.process(frames, args.label)  # compute once...
-    path = rec.save(result)                    # ...then persist
-    print(f"recorded {args.label}: {path}")
-    print(f"  samples={result.raw.shape[0]} features={result.features.shape[0]}")
+    reps = max(1, args.reps)
+    ticker = None if args.sim else _make_ticker(cfg)
+
+    saved = []
+    for i in range(reps):
+        if reps > 1:
+            print(f"\n=== sniff {i + 1}/{reps}  ·  label '{args.label}' ===")
+        reader = _make_reader(args, cfg, seed=args.seed + i)
+        frames = capture_session(reader, cfg, on_phase=_phase_cue, on_frame=ticker)
+        if ticker is not None:
+            print()  # end the \r status line
+        if not frames:
+            print("no frames captured; nothing recorded")
+            return 1
+
+        result = rec.process(frames, args.label)  # compute once...
+        path = rec.save(result)                    # ...then persist
+        saved.append(path)
+        print(
+            f"  saved {Path(path).name}  "
+            f"(samples={result.raw.shape[0]}, features={result.features.shape[0]})"
+        )
+
+        if not args.sim and i < reps - 1:
+            _recover_countdown(args.gap)
+
+    if reps > 1:
+        print(f"\nrecorded {len(saved)} × '{args.label}' → {args.out}")
+    else:
+        print(f"recorded {args.label}: {saved[0]}")
     return 0
 
 
@@ -205,11 +260,16 @@ def _cmd_identify(args) -> int:
     from .model import SmellModel
     from .geometry import serialize_geometry
 
+    from .capture import capture_session
+
     cfg = _load(args.config)
     model = SmellModel.load(args.model)
 
     reader = _make_reader(args, cfg)
-    frames = _collect_frames(reader)
+    ticker = None if args.sim else _make_ticker(cfg)
+    frames = capture_session(reader, cfg, on_phase=_phase_cue, on_frame=ticker)
+    if ticker is not None:
+        print()
     if not frames:
         print("no frames captured; nothing to identify")
         return 1
@@ -263,13 +323,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_stream.add_argument("--limit", type=int, default=5, help="frames to print")
     p_stream.set_defaults(func=_cmd_stream)
 
-    p_record = sub.add_parser("record", help="capture and save one sniff")
-    p_record.add_argument("--label", required=True, help="odor label for this sniff")
+    p_record = sub.add_parser("record", help="capture and save guided sniff(s)")
+    p_record.add_argument("--label", required=True, help="odor label for these sniffs")
     p_record.add_argument("--sim", action="store_true", help="use the simulator")
     p_record.add_argument("--config", default=None, help="path to a config TOML")
     p_record.add_argument("--out", default="data", help="output directory")
     p_record.add_argument("--port", default="/dev/ttyUSB0", help="serial port")
     p_record.add_argument("--seed", type=int, default=0)
+    p_record.add_argument("--reps", type=int, default=1, help="number of sniffs to capture")
+    p_record.add_argument(
+        "--gap", type=int, default=20, help="recovery seconds between reps (real capture)"
+    )
     p_record.set_defaults(func=_cmd_record, odor=None)
 
     p_sim = sub.add_parser("simulate", help="print per-odor plateau fractional summary")
