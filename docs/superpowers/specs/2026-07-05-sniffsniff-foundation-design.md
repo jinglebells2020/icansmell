@@ -2,32 +2,54 @@
 
 **Date:** 2026-07-05
 **Status:** Approved (design), pending implementation plan
-**Milestone:** 1 of N — "Foundation" (firmware + serial reader + Rs→Rs/R0→fractional 72-D feature chain)
+**Milestone:** 1 of N — "Foundation" (firmware + serial reader + Rs→Rs/R0→fractional feature chain)
 
 ## Purpose
 
 Build the make-or-break bedrock of an LLM-reasoning electronic nose: an Arduino Uno
-that streams a clean 9-channel MQ-sensor vector over USB, and a Python package that
-turns that stream into calibrated, drift-suppressed, labeled 72-dimensional feature
-vectors. Everything downstream (PCA/SOM map, classifier, novelty detection, LLM
-reasoner) consumes these vectors — but none of it is built in this milestone.
+that streams a clean N-channel MQ-sensor vector over USB, and a Python package that
+turns that stream into calibrated, drift-suppressed, labeled feature vectors.
+Everything downstream (PCA/SOM map, classifier, novelty detection, LLM reasoner)
+consumes these vectors — but none of it is built in this milestone.
 
 The hardware exists but is **not yet wired**. Therefore a **sensor simulator** is a
 first-class deliverable: it lets the entire Python pipeline be developed and tested
 today, with the real serial port swapping in later behind an identical interface.
 
+## Sensor selection — 6 MQ sensors
+
+The array is **6 sensors**, chosen for maximally *orthogonal* chemistry so clusters
+spread out instead of piling redundant signal on one axis:
+
+| Ch | Sensor | Target | Why it's in |
+|----|--------|--------|-------------|
+| C0 | MQ-2   | broad smoke / VOC        | General-purpose responder; reacts to almost everything — a good baseline dimension. |
+| C1 | MQ-3   | alcohol / ethanol        | The drinks workhorse (coffee, vinegar, anything fermented). Non-negotiable. |
+| C2 | MQ-4   | methane                  | Distinct axis; picks up dairy/fermentation notes differently than the rest. |
+| C3 | MQ-7   | carbon monoxide          | Different response curve again; cheap extra dimension. |
+| C4 | MQ-8   | hydrogen                 | The chemical odd-one-out — responds unlike the others, so it spreads clusters apart. |
+| C5 | MQ-135 | VOCs + ammonia           | The spoiled-milk punchline sensor. Non-negotiable. |
+
+Feature vector = **6 sensors × 8 features = 48-D per sniff**.
+
+**Channel-count-agnostic pipeline.** The Python package derives the channel count `N`
+from config (`Config.n_channels`), so resizing the array later is a config edit plus one
+firmware constant (`NCH`) and the CSV field count — not a code rewrite. `N = 6` is the
+concrete instance here; nothing in `calibrate`, `features`, `serialio`, or `record`
+hard-codes 6.
+
 ## Scope
 
 ### In scope (this milestone)
-- Arduino Uno firmware: scan 9 MQ sensors through a CD74HC4067 mux on one ADC pin,
+- Arduino Uno firmware: scan 6 MQ sensors through a CD74HC4067 mux on one ADC pin,
   dummy-read + averaging, stream CSV over USB serial at ~20 Hz.
 - Python `serialio`: parse the CSV stream into frames; robust to garbled lines and
   disconnects. A `SimulatedReader` with the identical interface.
-- Python `simulator`: synthetic 9-MQ array with per-odor response kinetics, seeded
+- Python `simulator`: synthetic 6-MQ array with per-odor response kinetics, seeded
   for reproducibility, emitting frames in the same shape as the real device.
 - Python `calibrate`: pure functions counts → V_RL → Rs → Rs/R0 → fractional.
 - Python `features`: a sniff window → 8 features/sensor (2 steady-state + 6 EMA
-  transient) → 72-D vector.
+  transient) → `N*8`-D vector.
 - Python `record`: three-phase sniff protocol (baseline → exposure → purge) with
   per-sniff R0 re-baselining; writes labeled sniff records to disk.
 - Config (`config` + `sniffsniff.toml`): board ADC params, per-channel sensor map +
@@ -35,7 +57,7 @@ today, with the real serial port swapping in later behind an identical interface
 - `cli`: `stream`, `record --label <name>`, `simulate`.
 - Tests (pytest): calibration, features, simulator, and an end-to-end sanity check.
 
-### Out of scope (explicitly deferred to later milestones — YAGNI)
+### Out of scope (explicitly deferred — YAGNI)
 - PCA / SOM / clustering / classifier / Mahalanobis novelty (Milestone 2).
 - LLM reasoning layer, geometry serialization, active-sniff loop (Milestone 3 — Claude API).
 - Servo/fan automation, physical chamber (hardware, user's domain).
@@ -50,17 +72,17 @@ calibration constants (R0, RL) can be tuned and features re-extracted without
 reflashing. The Uno's ~2 KB SRAM cannot hold feature buffers or a model regardless.
 
 ```
- [Uno firmware]  ── CSV "millis,c0,c1,…,c8" @ ~20 Hz ──►  USB serial
-        │                                                     │
-        │            (SimulatedReader swaps in here)          │
-        ▼                                                     ▼
-   serialio.SerialReader / SimulatedReader  ──►  frames: (t_ms, raw[9])
+ [Uno firmware]  ── CSV "millis,c0,…,c5" @ ~20 Hz ──►  USB serial
+        │                                                 │
+        │          (SimulatedReader swaps in here)        │
+        ▼                                                 ▼
+   serialio.SerialReader / SimulatedReader  ──►  frames: (t_ms, raw[N])
         ▼
    calibrate:  counts → V_RL → Rs = RL·(VCC−V_RL)/V_RL → r = Rs/R0 → y = r−1
         ▼
    record:  three-phase sniff (baseline → exposure → purge), re-baseline R0 per sniff
         ▼
-   features:  sniff window → 8 feats/sensor (2 steady + 6 EMA transient) → 72-D vector
+   features:  sniff window → 8 feats/sensor (2 steady + 6 EMA transient) → N*8-D vector
         ▼
    labeled dataset on disk  ── handoff to the ML milestone
 ```
@@ -70,15 +92,15 @@ reflashing. The Uno's ~2 KB SRAM cannot hold feature buffers or a model regardle
 One line per full-array scan, newline-terminated ASCII:
 
 ```
-<millis>,<c0>,<c1>,<c2>,<c3>,<c4>,<c5>,<c6>,<c7>,<c8>\n
+<millis>,<c0>,<c1>,<c2>,<c3>,<c4>,<c5>\n
 ```
 
 - `millis` — unsigned `millis()` timestamp from the Uno (wraps ~every 49 days; the
   host treats it as monotonic within a session and detects wrap).
-- `c0..c8` — integer raw ADC counts, 0–1023 (Uno 10-bit), one per mux channel C0–C8,
+- `c0..c5` — integer raw ADC counts, 0–1023 (Uno 10-bit), one per mux channel C0–C5,
   each already the average of N samples on-device.
-- ~20 Hz (one line per ~50 ms). Field count is always 10; the host skips any line
-  that doesn't parse to exactly 10 integers.
+- ~20 Hz (one line per ~50 ms). Field count is always `NCH + 1` (7); the host skips any
+  line that doesn't parse to exactly that many integers.
 
 Raw counts (not millivolts) travel on the wire so all conversion constants live in
 Python config, not firmware.
@@ -124,15 +146,15 @@ moving average `ema_α[k] = (1−α)·ema_α[k−1] + α·Δy[k]` for `α ∈ {0
 3–5. `ema_rise_α` — max `ema_α` over the **rising** (exposure) phase, one per α.
 6–8. `ema_decay_α` — min `ema_α` over the **decaying** (purge/recovery) phase, one per α.
 
-9 sensors × 8 features = **72-D vector** per sniff. Feature order is fixed and recorded
-in the dataset so downstream code has a stable column layout.
+6 sensors × 8 features = **48-D vector** per sniff. Feature order is fixed
+(sensor-major) and recorded in the dataset so downstream code has a stable column layout.
 
 ## Sensor simulator (`simulator.py`)
 
-Emits frames in the exact `(t_ms, raw[9])` shape, so it is a drop-in for the serial
+Emits frames in the exact `(t_ms, raw[N])` shape, so it is a drop-in for the serial
 reader. Model per sensor:
 
-- Clean-air baseline resistance `R_base[ch]`.
+- Clean-air baseline resistance `R_base[ch]` (deterministic per channel).
 - Per-odor multiplicative response gain `g[odor][ch]` (reducing gases drop Rs): during
   exposure, `Rs` relaxes toward `R_base/(1+g)` with rise time constant `τ_rise`; during
   purge, relaxes back toward `R_base` with `τ_decay` (`τ_decay > τ_rise`, slow desorption).
@@ -142,7 +164,8 @@ reader. Model per sensor:
 
 Odor profiles (initial set, tunable): `clean_air`, `coffee`, `vinegar`, `alcohol`,
 `fresh_milk`, `spoiled_milk`, with gains chosen so the fractional signatures are
-separable (e.g. alcohol strong on the MQ-3 channel, vinegar/spoiled-milk on MQ-135).
+separable given the 6-sensor chemistry (alcohol strong on MQ-3; vinegar & spoiled-milk
+on MQ-135; methane/H₂/CO axes on MQ-4/MQ-8/MQ-7 pull the dairy classes apart).
 
 ## Configuration (`sniffsniff.toml`)
 
@@ -153,17 +176,14 @@ vref = 5.0         # Uno ADC reference volts
 
 [array]
 vcc = 5.0          # sensor supply volts
-# one entry per mux channel C0..C8 — CONFIRM sensor + RL against your actual modules
+# one entry per mux channel C0..C5 — CONFIRM RL against your actual modules
 channels = [
   { ch = 0, sensor = "MQ2",   rl = 1000 },
   { ch = 1, sensor = "MQ3",   rl = 1000 },
   { ch = 2, sensor = "MQ4",   rl = 1000 },
-  { ch = 3, sensor = "MQ5",   rl = 1000 },
-  { ch = 4, sensor = "MQ6",   rl = 1000 },
-  { ch = 5, sensor = "MQ7",   rl = 1000 },
-  { ch = 6, sensor = "MQ8",   rl = 1000 },
-  { ch = 7, sensor = "MQ9",   rl = 1000 },
-  { ch = 8, sensor = "MQ135", rl = 1000 },
+  { ch = 3, sensor = "MQ7",   rl = 1000 },
+  { ch = 4, sensor = "MQ8",   rl = 1000 },
+  { ch = 5, sensor = "MQ135", rl = 1000 },
 ]
 
 [timing]
@@ -182,21 +202,20 @@ recover_tol = 0.02 # ±2% of R0 to count as recovered
 ```
 
 `rl = 1000` reflects that cheap MQ modules commonly ship a 1 kΩ load resistor; the
-operator confirms/measures per module. The sensor↔channel map is an **assumption to
-confirm before wiring**, not a fixed fact.
+operator confirms/measures per module. The number of channel entries defines `N`.
 
 ## On-disk dataset format
 
 Per sniff, one compressed `data/<label>/<id>.npz` containing:
-- `raw` — int array `[T, 9]` of ADC counts.
+- `raw` — int array `[T, N]` of ADC counts.
 - `t_ms` — int array `[T]` of device timestamps.
-- `fractional` — float array `[T, 9]` of `y(t)`.
-- `r0` — float array `[9]` of the R0 used.
-- `features` — float array `[72]`.
+- `fractional` — float array `[T, N]` of `y(t)`.
+- `r0` — float array `[N]` of the R0 used.
+- `features` — float array `[N*8]`.
 - `meta` — JSON blob: label, session id, sniff id, ISO timestamp, phase boundaries
   (baseline/exposure/purge sample indices), feature column names, config snapshot.
 
-Plus a `data/manifest.csv` appended one row per sniff: `id,label,iso_time,path,n_samples,notes`.
+Plus a `data/manifest.csv` appended one row per sniff: `id,label,path,n_samples`.
 
 `data/` is git-ignored.
 
@@ -209,16 +228,18 @@ sniffsniff/
   firmware/sniffsniff_uno/sniffsniff_uno.ino
   src/sniffsniff/
     __init__.py
-    config.py        # load/validate sniffsniff.toml → typed config object
+    config.py        # load/validate sniffsniff.toml → typed Config object
     serialio.py      # SerialReader + SimulatedReader (shared frame interface)
-    simulator.py     # synthetic 9-MQ array
+    simulator.py     # synthetic N-MQ array
     calibrate.py     # pure counts→V→Rs→ratio→fractional
-    features.py      # pure sniff-window → 72-D vector
+    features.py      # pure sniff-window → N*8-D vector
     record.py        # three-phase protocol + R0 + dataset writer
     cli.py           # stream / record / simulate entry points
   tests/
+    test_config.py
     test_calibrate.py
     test_features.py
+    test_serialio.py
     test_simulator.py
     test_record.py
     test_end_to_end.py
@@ -228,17 +249,18 @@ sniffsniff/
 
 ## Firmware (`firmware/sniffsniff_uno/sniffsniff_uno.ino`)
 
+- `NCH = 6` (channel count constant — the one firmware value tied to array size).
 - Pins: `S0..S3` on `D4,D5,D6,D7`; mux `SIG` on `A0`; mux `EN` tied to GND (active-LOW,
   always enabled).
-- `selectCh(c)`: write the 4 address bits.
+- `selectCh(c)`: write the 4 address bits (LSB = S0).
 - Per channel: set address → `delayMicroseconds(100)` settle → one `analogRead(A0)`
   discarded → average `N = 16` reads.
-- Print `millis(),c0,…,c8` then `delay(50)` (~20 Hz full scan).
+- Print `millis(),c0,…,c5` then `delay(50)` (~20 Hz full scan).
 - No floating-point on-device; raw 10-bit counts only.
 - Header comments document hardware musts: external **5 V ≥3 A** supply for the heaters
-  (9 × ~150–180 mA ≈ 1.4–1.6 A), common ground with the Uno, unused mux channels
-  C9–C15 tied to GND, 100 nF VCC→GND on the mux, 24–48 h first-power burn-in and
-  3–5 min warm-up each session.
+  (6 × ~150–180 mA ≈ 0.9–1.1 A; a 2 A+ supply is fine, 3 A leaves headroom), common
+  ground with the Uno, unused mux channels C6–C15 tied to GND, 100 nF VCC→GND on the mux,
+  24–48 h first-power burn-in and 3–5 min warm-up each session.
 
 ## Error handling
 
@@ -252,14 +274,19 @@ sniffsniff/
 
 ## Testing strategy (TDD — tests before implementation for the pure math)
 
+- **`test_config.py`** — `default_config` has 6 channels in order; `load_config` round-trips
+  `sniffsniff.toml`; rejects a channel table of the wrong size / duplicate `ch`.
 - **`test_calibrate.py`** — closed-form cases (the 40 kΩ example above; ratio; fractional;
-  the div-by-zero guard).
+  the div-by-zero guard); array inputs vectorize.
 - **`test_features.py`** — analytic step/exponential curves with hand-derived peak,
-  plateau, and EMA values (the exact 8-feature set; no area term in this milestone).
+  plateau, and EMA values (the exact 8-feature set; no area term in this milestone);
+  `feature_names` length `N*8` with correct sensor-major ordering.
+- **`test_serialio.py`** — `parse_line` valid/malformed/wrong-field-count; `SerialReader`
+  via an injected fake serial (no hardware).
 - **`test_simulator.py`** — same seed ⇒ identical frames; distinct odor profiles produce
-  separable fractional signatures.
-- **`test_record.py`** — three-phase segmentation and R0 computation on simulated input;
-  correct `.npz`/manifest output.
+  separable fractional signatures; `SimulatedReader` replays exactly.
+- **`test_record.py`** — three-phase segmentation, R0 computation, deterministic ids, and
+  `.npz`/manifest round-trip on simulated input.
 - **`test_end_to_end.py`** — simulate ≥3 classes → record → features; assert within-class
   vectors are closer (Euclidean) than across-class (sanity, not a trained model).
 
@@ -270,12 +297,13 @@ plain stdout — no heavy TUI dependency in this milestone.
 
 ## Assumptions to confirm before wiring (not blockers for software)
 
-1. Exact sensor-per-channel mapping (the `[array].channels` table is a placeholder).
-2. Actual RL value on each module (measure AO→GND unpowered; many are 1 kΩ).
-3. Digital pin assignments `D4–D7` for `S0–S3` (any 4 free digital pins work).
+1. Actual RL value on each module (measure AO→GND unpowered; many are 1 kΩ).
+2. Digital pin assignments `D4–D7` for `S0–S3` (any 4 free digital pins work).
+3. Sensor→channel order in the table is the assumed wiring; match your physical build to it
+   (or edit the config — it only affects feature-column *labels*, since RL cancels in ratios).
 
 ## Handoff to next milestone
 
-This milestone's output — a growing folder of labeled 72-D vectors plus the tooling to
+This milestone's output — a growing folder of labeled 48-D vectors plus the tooling to
 record more — is exactly the input the ML milestone (PCA/SOM/classifier/novelty) needs.
 The `features` column layout and dataset schema are the stable contract between them.
