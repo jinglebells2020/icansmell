@@ -23,7 +23,7 @@ import numpy as np
 
 from . import calibrate
 from .record import SniffRecorder
-from .recovery import RecoveryMonitor, StabilityMonitor
+from .recovery import RecoveryMonitor, ResponsePlateauMonitor, StabilityMonitor
 from .simulator import ODOR_PROFILES
 
 __all__ = ["MonitorEngine", "ContinuousSim"]
@@ -67,6 +67,8 @@ class MonitorEngine:
         settle_hold_s=None,
         settle_max_wait_s=None,
         plateau_hold_s=None,
+        min_exposure_s=None,
+        plateau_eps=None,
         smooth_alpha=None,
     ):
         self.config = config
@@ -80,6 +82,10 @@ class MonitorEngine:
         self.plateau_hold_s = (
             config.plateau_hold_s if plateau_hold_s is None else plateau_hold_s
         )
+        self.min_exposure_s = (
+            config.min_exposure_s if min_exposure_s is None else min_exposure_s
+        )
+        self.plateau_eps = config.plateau_eps if plateau_eps is None else plateau_eps
         self.smooth_alpha = config.smooth_alpha if smooth_alpha is None else smooth_alpha
         # Fixed baseline & purge lengths; exposure is DYNAMIC (baseline..plateau/cap).
         hz = config.scan_hz
@@ -99,10 +105,9 @@ class MonitorEngine:
         self._phase: str | None = None
         self._recovery: RecoveryMonitor | None = None
         # per-capture dynamic-exposure state (reset when a capture begins)
-        self._plateau: StabilityMonitor | None = None
+        self._plateau: ResponsePlateauMonitor | None = None
         self._exp_end: int | None = None
         self._r0_est: np.ndarray | None = None
-        self._responded = False
         # optional airflow sink the engine drives per phase (fresh vs sample straw)
         self._airflow = None
 
@@ -182,6 +187,8 @@ class MonitorEngine:
         * ``capture``  — ``(k, n)`` progress during a capture, else None.
         * ``saved``    — ``(SniffResult, path)`` on the frame a capture completes, else None.
         * ``recovery`` — the :class:`RecoveryMonitor` status dict while tracking, else None.
+        * ``settle``   — the settle :class:`StabilityMonitor` status while settling, else None.
+        * ``plateau``  — the :class:`ResponsePlateauMonitor` status during exposure, else None.
         """
         raw = frame[1]
         rs = _rs_of(raw, self.config)
@@ -193,6 +200,7 @@ class MonitorEngine:
             "saved": None,
             "recovery": None,
             "settle": None,
+            "plateau": None,
         }
 
         # Promote a pending request into the SETTLE phase (wait for a stable baseline
@@ -226,7 +234,6 @@ class MonitorEngine:
                 self._plateau = None
                 self._exp_end = None
                 self._r0_est = None
-                self._responded = False
             return event
 
         if self._capturing:
@@ -236,29 +243,28 @@ class MonitorEngine:
             if n_so_far <= self.n_base:
                 phase = "baseline"                       # fixed-length clean-air window
             elif self._exp_end is None:
-                phase = "exposure"                       # dynamic — hold until plateau
+                phase = "exposure"                       # dynamic — hold until it stops growing
                 if self._plateau is None:
                     # entering exposure: fix R0 from the baseline window and start the
-                    # plateau detector (no max_wait — the exposure cap bounds it).
+                    # growth-plateau detector (min floor + hold; the cap bounds it).
                     base = np.array(
                         [_rs_of(f[1], self.config) for f in self._buf[: self.n_base]]
                     )
                     self._r0_est = base.mean(axis=0)
-                    self._plateau = StabilityMonitor(
-                        self.config.recover_tol, self.config.scan_hz,
-                        hold_s=self.plateau_hold_s, max_wait_s=None,
-                        ema_alpha=self.smooth_alpha,
+                    # Clamp the min-exposure floor to the cap: if a config sets
+                    # exposure_s < min_exposure_s, the cap bounds the sniff anyway, so
+                    # keep the plateau gate *live* up to the cap rather than silently
+                    # inert (min_frames > cap would make `plateaued` unreachable).
+                    min_s = min(self.min_exposure_s, self.n_exp_max / self.config.scan_hz)
+                    self._plateau = ResponsePlateauMonitor(
+                        self._r0_est, self.config.scan_hz,
+                        hold_s=self.plateau_hold_s, min_s=min_s,
+                        eps=self.plateau_eps, ema_alpha=self.smooth_alpha,
                     )
-                # only let the plateau gate fire once the response has actually moved
-                # off baseline — otherwise the still-flat first frames look "plateaued".
-                if not self._responded:
-                    dev = np.abs(rs / self._r0_est - 1.0)
-                    finite = np.isfinite(dev)
-                    if finite.any() and float(dev[finite].max()) > self.config.recover_tol:
-                        self._responded = True
                 st = self._plateau.update(rs)
+                event["plateau"] = st                    # live exposure feedback for the UI
                 exp_len = n_so_far - self.n_base
-                if (st["stable"] and self._responded) or exp_len >= self.n_exp_max:
+                if st["plateaued"] or exp_len >= self.n_exp_max:
                     self._exp_end = n_so_far             # this frame is the last exposure frame
             else:
                 phase = "purge"                          # fixed-length recovery window

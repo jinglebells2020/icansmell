@@ -16,7 +16,7 @@ from collections import deque
 
 import numpy as np
 
-__all__ = ["RecoveryMonitor", "StabilityMonitor"]
+__all__ = ["RecoveryMonitor", "StabilityMonitor", "ResponsePlateauMonitor"]
 
 
 class StabilityMonitor:
@@ -90,6 +90,104 @@ class StabilityMonitor:
             "max_dev": max_dev,
             "waited_s": self._count / self.scan_hz,
             "timed_out": bool(timed_out and not stable),
+        }
+
+
+class ResponsePlateauMonitor:
+    """Detect when a sniff's response has *stopped growing* — a real plateau.
+
+    The naive "is Rs flat within ±tol?" test fails on real hardware: a weak, slow
+    odor (fresh milk creeps up at ~0.2 %/s) has a per-frame slope buried in sensor
+    noise, so a coarse flatness window reads "plateaued" while the response is still
+    climbing — and exposure ends far too early. Measured on the real rig, milk's rise
+    rate sits *below* the derivative noise band, so slope alone can't decide.
+
+    Instead, gate on *growth of the aggregate response magnitude*
+    ``m = mean_ch |Rs/R0 - 1|`` (a single scalar; per-channel quantization noise
+    averages out). Track the running peak of ``m``; while the response keeps setting
+    new highs (gains at least ``eps``) it is still developing. Declare a plateau only
+    once ``m`` has gone ``hold_s`` **without** a meaningful new high *and* at least
+    ``min_s`` has elapsed. A still-rising response (milk) therefore keeps the exposure
+    open until the caller's cap; one that truly flattens (a strong odor) stops early.
+
+    Parameters
+    ----------
+    r0:
+        Per-channel clean-air baseline resistance ``(N,)`` measured this sniff.
+    scan_hz:
+        Frame rate, to size ``hold_s`` / ``min_s`` in frames.
+    hold_s:
+        Seconds the response must go without a new high before it counts as plateaued.
+    min_s:
+        Minimum exposure floor — never declare a plateau before this (lets the
+        response develop; replaces the old "has it moved off baseline?" guard).
+    eps:
+        Minimum *fractional* growth of ``m`` that counts as a genuine new high
+        (e.g. ``0.005`` = 0.5 percentage-points of R0). Set well above the noise of
+        ``m`` so jitter can't fake continued growth.
+    ema_alpha:
+        Optional EMA factor to smooth ``m`` (0/None = off).
+    """
+
+    def __init__(self, r0, scan_hz: int, *, hold_s: float, min_s: float,
+                 eps: float, ema_alpha=None):
+        self.r0 = np.asarray(r0, dtype=np.float64)
+        self.scan_hz = int(scan_hz)
+        self.hold_frames = max(1, round(float(hold_s) * scan_hz))
+        self.min_frames = max(1, round(float(min_s) * scan_hz))
+        self.eps = float(eps)
+        self.ema_alpha = float(ema_alpha) if ema_alpha else None
+        self._ema = None
+        self._peak = -np.inf
+        self._since_high = 0      # frames since the last meaningful new high
+        self._count = 0           # frames elapsed (exposure length so far)
+
+    def update(self, rs) -> dict:
+        """Feed one live ``Rs`` vector ``(N,)``; return a status dict.
+
+        Keys: ``plateaued`` (growth has stalled ``hold_s`` past the ``min_s`` floor),
+        ``mag`` (smoothed aggregate response magnitude, fractional), ``peak``,
+        ``elapsed_s`` (exposure so far), ``held_s`` (seconds since the last new high),
+        ``min_s`` (the floor).
+        """
+        self._count += 1
+        rs = np.asarray(rs, dtype=np.float64)
+        frac = rs / self.r0 - 1.0
+        frac = np.where(np.isfinite(frac), frac, 0.0)   # dead/open channel → 0 weight
+        mag = float(np.abs(frac).mean())
+        if self.ema_alpha is not None:
+            self._ema = (
+                mag if self._ema is None
+                else self.ema_alpha * mag + (1.0 - self.ema_alpha) * self._ema
+            )
+            mag = self._ema
+
+        if self._count == 1:
+            # Seed only: don't let a single, still-unsmoothed first frame define the
+            # peak (a frame-1 noise spike could otherwise suppress genuine later
+            # growth). Begin new-high / hold tracking from the next, smoothed frame.
+            return {
+                "plateaued": False, "mag": mag, "peak": mag,
+                "elapsed_s": self._count / self.scan_hz, "held_s": 0.0,
+                "min_s": self.min_frames / self.scan_hz,
+            }
+
+        if mag > self._peak + self.eps:
+            self._peak = mag
+            self._since_high = 0
+        else:
+            self._since_high += 1
+
+        plateaued = (
+            self._count >= self.min_frames and self._since_high >= self.hold_frames
+        )
+        return {
+            "plateaued": bool(plateaued),
+            "mag": mag,
+            "peak": float(self._peak),
+            "elapsed_s": self._count / self.scan_hz,
+            "held_s": self._since_high / self.scan_hz,
+            "min_s": self.min_frames / self.scan_hz,
         }
 
 

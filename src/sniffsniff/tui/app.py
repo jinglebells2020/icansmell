@@ -276,7 +276,23 @@ class SniffApp(App):
         if ev["capture"] is not None:
             k, n = ev["capture"]
             pct = k * 100 // n
-            self._status(f"⏺ capturing '{self._active_label}' — {phase} {k}/{n} ({pct}%)")
+            pl = ev["plateau"]
+            if phase == "exposure" and pl is not None:
+                # show the response developing so the operator can trust the timing:
+                # magnitude, and whether it's still rising or holding toward a plateau.
+                growing = pl["held_s"] < 1.0
+                tail = (
+                    "still rising" if growing
+                    else f"holding {pl['held_s']:.0f}/{self._engine.plateau_hold_s:.0f}s"
+                )
+                self._status(
+                    f"⏺ '{self._active_label}' exposure {pl['elapsed_s']:.0f}s — "
+                    f"response {pl['mag'] * 100:.1f}% ({tail})"
+                )
+            else:
+                self._status(
+                    f"⏺ capturing '{self._active_label}' — {phase} {k}/{n} ({pct}%)"
+                )
 
         if ev["saved"] is not None:
             self._on_capture_complete(ev["saved"])

@@ -41,5 +41,10 @@ sample_angle = 105     # substance open / fresh-air closed (exposure)
 [capture]              # adaptive-capture tuning (tolerance reuses recover_tol)
 settle_hold_s = 3.0    # signal must be flat this long before measuring R0
 settle_max_wait_s = 30 # give up settling after this and proceed anyway
-plateau_hold_s = 3.0   # exposure ends after the response holds flat this long
+# Dynamic exposure ends when the response STOPS GROWING (no new high for
+# plateau_hold_s), never before min_exposure_s, capped by [timing] exposure_s.
+# Tuned on the real rig: weak/slow odors (milk) ride to the cap; strong odors stop early.
+min_exposure_s = 15.0  # exposure floor — never plateau-stop before this
+plateau_hold_s = 8.0   # end after the response sets no new high (>= plateau_eps) this long
+plateau_eps = 0.005    # min fractional growth (0.5pp of R0) counted as a genuine new high
 smooth_alpha = 0.2     # EMA smoothing for the settle/recovery detectors (0 = off)

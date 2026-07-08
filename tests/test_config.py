@@ -261,5 +261,7 @@ def test_default_config_has_capture_tuning():
     c = default_config()
     assert c.settle_hold_s == 3.0
     assert c.settle_max_wait_s == 30.0
-    assert c.plateau_hold_s == 3.0
+    assert c.min_exposure_s == 15.0
+    assert c.plateau_hold_s == 8.0
+    assert c.plateau_eps == 0.005
     assert c.smooth_alpha == 0.2

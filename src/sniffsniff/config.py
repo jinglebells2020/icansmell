@@ -54,7 +54,13 @@ class Config:
     # the settle/recovery detectors. Tolerance reuses ``recover_tol``.
     settle_hold_s: float = 3.0        # signal must be flat this long before baseline
     settle_max_wait_s: float = 30.0   # give up settling after this (proceed anyway)
-    plateau_hold_s: float = 3.0       # exposure ends after the response is flat this long
+    # Dynamic exposure ends when the aggregate response STOPS GROWING (stops setting
+    # new highs for plateau_hold_s), never before min_exposure_s, capped by exposure_s.
+    # Gating on growth (not flatness) keeps weak/slow odors — whose slope is buried in
+    # sensor noise — from being cut short. Tuned on the real rig (fresh milk).
+    min_exposure_s: float = 15.0      # exposure floor — never plateau-stop before this
+    plateau_hold_s: float = 8.0       # end after the response sets no new high this long
+    plateau_eps: float = 0.005        # min fractional growth counted as a new high (0.5pp)
     smooth_alpha: float = 0.2         # EMA factor for the detectors (0 = no smoothing)
 
     def rl_array(self) -> np.ndarray:
@@ -124,7 +130,9 @@ def _config_from_dict(data: dict) -> Config:
         servo_sample_angle=int(servo.get("sample_angle", 105)),
         settle_hold_s=float(capture.get("settle_hold_s", 3.0)),
         settle_max_wait_s=float(capture.get("settle_max_wait_s", 30.0)),
-        plateau_hold_s=float(capture.get("plateau_hold_s", 3.0)),
+        min_exposure_s=float(capture.get("min_exposure_s", 15.0)),
+        plateau_hold_s=float(capture.get("plateau_hold_s", 8.0)),
+        plateau_eps=float(capture.get("plateau_eps", 0.005)),
         smooth_alpha=float(capture.get("smooth_alpha", 0.2)),
     )
 
@@ -166,6 +174,8 @@ def default_config() -> Config:
         servo_sample_angle=105,
         settle_hold_s=3.0,
         settle_max_wait_s=30.0,
-        plateau_hold_s=3.0,
+        min_exposure_s=15.0,
+        plateau_hold_s=8.0,
+        plateau_eps=0.005,
         smooth_alpha=0.2,
     )

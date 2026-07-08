@@ -166,12 +166,15 @@ def test_capture_without_save_does_not_write(tmp_path):
     assert eng.step(sim.read())["recovery"] is not None
 
 
-def test_exposure_ends_on_plateau_before_the_cap(tmp_path):
-    """Dynamic exposure: a fast-responding array plateaus well before the cap."""
+def test_exposure_ends_when_response_stops_growing(tmp_path):
+    """Dynamic exposure: a fast odor that plateaus stops well before the cap."""
     cfg = dataclasses.replace(
         default_config(), baseline_s=0.5, exposure_s=30, purge_s=0.5, plateau_s=0.5
     )
-    eng = _engine(cfg, tmp_path, plateau_hold_s=0.5, smooth_alpha=0.0)
+    # fast rise (settles ~3s) -> growth stops -> plateau after min_s + hold_s
+    eng = _engine(
+        cfg, tmp_path, min_exposure_s=2.0, plateau_hold_s=0.5, smooth_alpha=0.0
+    )
     sim = ContinuousSim(cfg, seed=0, noise_counts=0.0, tau_rise=0.5, tau_decay=0.5)
     sim.set_odor("coffee")
     eng.set_airflow(sim.write_command)
@@ -179,27 +182,37 @@ def test_exposure_ends_on_plateau_before_the_cap(tmp_path):
     _settle(eng, sim)
 
     saved = None
+    plateau_fired = False
     for _ in range(eng.n):          # eng.n is the CAP ceiling; the plateau ends sooner
         ev = eng.step(sim.read())
+        if ev["plateau"] is not None and ev["plateau"]["plateaued"]:
+            plateau_fired = True    # the growth gate — not the cap — ended exposure
         if ev["saved"] is not None:
             saved = ev["saved"]
             break
     assert saved is not None
+    assert plateau_fired                         # exposure ended because growth stopped
     result, _ = saved
     b_end = result.slices["baseline"][1]
     e_end = result.slices["exposure"][1]
-    assert (e_end - b_end) < eng.n_exp_max       # ended on the plateau, not the cap
+    exp_len = e_end - b_end
+    assert exp_len < eng.n_exp_max               # ended on the plateau, not the cap
+    assert exp_len >= round(2.0 * cfg.scan_hz)   # but respected the min-exposure floor
     assert result.features.shape[0] == 48
 
 
-def test_exposure_hits_the_cap_without_a_plateau(tmp_path):
-    """No plateau (still rising at the cap) → exposure ends at exactly the cap."""
+def test_exposure_stays_open_while_still_rising(tmp_path):
+    """A steadily-rising response keeps setting new highs → runs to the cap
+    (the real-milk truncation this fix exists to prevent)."""
     cfg = dataclasses.replace(
-        default_config(), baseline_s=0.5, exposure_s=1.0, purge_s=0.5, plateau_s=0.5
+        default_config(), baseline_s=0.5, exposure_s=3.0, purge_s=0.5, plateau_s=0.5
     )
-    # very slow rise + a long plateau requirement -> the plateau never triggers
-    eng = _engine(cfg, tmp_path, plateau_hold_s=5.0, smooth_alpha=0.0)
-    sim = ContinuousSim(cfg, seed=0, noise_counts=0.0, tau_rise=60.0, tau_decay=60.0)
+    # a strong, still-fast rise that never plateaus within the 3s cap -> always
+    # setting new highs (aggregate slope stays well above eps/hold_s throughout)
+    eng = _engine(
+        cfg, tmp_path, min_exposure_s=0.5, plateau_hold_s=1.0, smooth_alpha=0.0
+    )
+    sim = ContinuousSim(cfg, seed=0, noise_counts=0.0, tau_rise=8.0, tau_decay=8.0)
     sim.set_odor("coffee")
     eng.set_airflow(sim.write_command)
     eng.arm_capture("coffee")
@@ -214,4 +227,4 @@ def test_exposure_hits_the_cap_without_a_plateau(tmp_path):
     result, _ = saved
     b_end = result.slices["baseline"][1]
     e_end = result.slices["exposure"][1]
-    assert (e_end - b_end) == eng.n_exp_max      # capped
+    assert (e_end - b_end) == eng.n_exp_max      # rode to the cap, not truncated

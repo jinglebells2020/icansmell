@@ -167,3 +167,94 @@ def test_recovery_smoothing_reaches_recovered_under_noise():
             recovered = True
             break
     assert recovered  # smoothed signal at baseline is judged recovered despite noise
+
+
+# --- ResponsePlateauMonitor (dynamic-exposure end: gate on growth) -----------
+
+from pathlib import Path
+
+from sniffsniff.recovery import ResponsePlateauMonitor
+
+_R0 = np.array([40000.0, 20000.0, 60000.0])
+
+
+def _plateau(hold_s=1.0, min_s=0.5, eps=0.005, hz=20, ema=None):
+    return ResponsePlateauMonitor(_R0, hz, hold_s=hold_s, min_s=min_s, eps=eps, ema_alpha=ema)
+
+
+def test_plateau_not_before_min_floor():
+    # a flat (no-growth) signal still must not plateau before the min_s floor
+    m = _plateau(hold_s=0.2, min_s=1.0, hz=20)  # min = 20 frames, hold = 4 frames
+    for i in range(19):
+        assert m.update(_R0 * 1.05)["plateaued"] is False
+    assert m.update(_R0 * 1.05)["plateaued"] is True  # 20th frame clears the floor
+
+
+def test_plateau_fires_after_growth_stops():
+    m = _plateau(hold_s=0.5, min_s=0.25, hz=20)  # hold = 10 frames, min = 5
+    # rising phase: keeps setting new highs -> never plateaus
+    for g in np.linspace(0.0, 0.10, 40):
+        assert m.update(_R0 * (1 + g))["plateaued"] is False
+    # then hold flat: after hold_s of no new high it plateaus
+    fired = False
+    for _ in range(20):
+        if m.update(_R0 * 1.10)["plateaued"]:
+            fired = True
+            break
+    assert fired
+
+
+def test_plateau_stays_open_while_slowly_rising():
+    # a slow, steady creep keeps setting new highs (> eps per hold window) -> never
+    # plateaus; this is the milk-truncation bug the growth gate exists to prevent.
+    m = _plateau(hold_s=0.5, min_s=0.25, hz=20, eps=0.002)
+    plateaued = False
+    for i in range(400):
+        g = 0.0003 * i  # ~0.03pp per frame, monotonic
+        if m.update(_R0 * (1 + g))["plateaued"]:
+            plateaued = True
+            break
+    assert plateaued is False  # still growing the whole time
+
+
+def test_plateau_eps_ignores_sub_eps_jitter():
+    # jitter smaller than eps must NOT count as a new high (else a plateau never fires)
+    rng = np.random.default_rng(0)
+    m = _plateau(hold_s=0.5, min_s=0.25, hz=20, eps=0.01, ema=0.3)
+    # rise then hold at a plateau with small (<eps) noise
+    for g in np.linspace(0, 0.08, 30):
+        m.update(_R0 * (1 + g))
+    fired = False
+    for _ in range(60):
+        noisy = _R0 * (1 + 0.08 + 0.001 * rng.standard_normal(3))  # ~0.1pp jitter << eps
+        if m.update(noisy)["plateaued"]:
+            fired = True
+            break
+    assert fired  # sub-eps jitter didn't keep resetting the new-high timer
+
+
+def test_real_milk_curve_is_not_truncated():
+    """Regression: the REAL fresh-milk exposure (captured on the rig) must ride to
+    the cap, not plateau-stop early — with the SHIPPED config parameters."""
+    from sniffsniff.config import default_config
+
+    fx = Path(__file__).parent / "data" / "milk_exposure.npz"
+    d = np.load(fx)
+    rs_exp, t_exp, r0 = d["rs_exp"].astype(float), d["t_exp"].astype(float), d["r0"].astype(float)
+    hz = float(d["eff_hz"])
+    cfg = default_config()
+
+    m = ResponsePlateauMonitor(
+        r0, round(hz), hold_s=cfg.plateau_hold_s, min_s=cfg.min_exposure_s,
+        eps=cfg.plateau_eps, ema_alpha=cfg.smooth_alpha,
+    )
+    plateau_time = None
+    for k, rs in enumerate(rs_exp):
+        if m.update(rs)["plateaued"]:
+            plateau_time = float(t_exp[k])
+            break
+    # milk is still rising through the whole 60 s window; it must NOT stop early.
+    # (Before the fix it ended at ~3.7 s, capturing ~20% of the response.)
+    assert plateau_time is None or plateau_time >= 40.0, (
+        f"milk exposure truncated at {plateau_time:.1f}s — should ride to the cap"
+    )
