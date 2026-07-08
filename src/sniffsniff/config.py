@@ -15,7 +15,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Channel:
-    """One mux channel: its index, the sensor wired to it, and its load resistor."""
+    """One channel: its index, the sensor wired to it, and its load resistor."""
 
     ch: int
     sensor: str
@@ -116,12 +116,12 @@ def load_config(path) -> Config:
 def default_config() -> Config:
     """Return the built-in defaults matching ``sniffsniff.toml`` (no file read)."""
     channels = (
-        Channel(ch=0, sensor="MQ2", rl=1000.0),
-        Channel(ch=1, sensor="MQ3", rl=1000.0),
-        Channel(ch=2, sensor="MQ4", rl=1000.0),
-        Channel(ch=3, sensor="MQ7", rl=1000.0),
+        Channel(ch=0, sensor="MQ3", rl=1000.0),
+        Channel(ch=1, sensor="MQ135", rl=1000.0),
+        Channel(ch=2, sensor="MQ2", rl=1000.0),
+        Channel(ch=3, sensor="MQ4", rl=1000.0),
         Channel(ch=4, sensor="MQ8", rl=1000.0),
-        Channel(ch=5, sensor="MQ135", rl=1000.0),
+        Channel(ch=5, sensor="MQ7", rl=1000.0),
     )
     return Config(
         bits=10,

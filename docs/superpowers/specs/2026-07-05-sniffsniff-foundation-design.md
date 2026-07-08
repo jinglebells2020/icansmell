@@ -1,7 +1,7 @@
 # sniffsniff — Foundation Milestone Design
 
 **Date:** 2026-07-05
-**Status:** Approved (design), pending implementation plan
+**Status:** Implemented (113 tests green, firmware compiles); hardware wired direct A0–A5
 **Milestone:** 1 of N — "Foundation" (firmware + serial reader + Rs→Rs/R0→fractional feature chain)
 
 ## Purpose
@@ -12,23 +12,23 @@ turns that stream into calibrated, drift-suppressed, labeled feature vectors.
 Everything downstream (PCA/SOM map, classifier, novelty detection, LLM reasoner)
 consumes these vectors — but none of it is built in this milestone.
 
-The hardware exists but is **not yet wired**. Therefore a **sensor simulator** is a
-first-class deliverable: it lets the entire Python pipeline be developed and tested
-today, with the real serial port swapping in later behind an identical interface.
+The hardware is now wired (6 MQ modules direct to A0–A5), but a **sensor simulator**
+remains a first-class deliverable: it lets the entire Python pipeline be developed,
+tested, and run in CI with no hardware, behind the same interface as the real serial port.
 
 ## Sensor selection — 6 MQ sensors
 
 The array is **6 sensors**, chosen for maximally *orthogonal* chemistry so clusters
 spread out instead of piling redundant signal on one axis:
 
-| Ch | Sensor | Target | Why it's in |
-|----|--------|--------|-------------|
-| C0 | MQ-2   | broad smoke / VOC        | General-purpose responder; reacts to almost everything — a good baseline dimension. |
-| C1 | MQ-3   | alcohol / ethanol        | The drinks workhorse (coffee, vinegar, anything fermented). Non-negotiable. |
-| C2 | MQ-4   | methane                  | Distinct axis; picks up dairy/fermentation notes differently than the rest. |
-| C3 | MQ-7   | carbon monoxide          | Different response curve again; cheap extra dimension. |
-| C4 | MQ-8   | hydrogen                 | The chemical odd-one-out — responds unlike the others, so it spreads clusters apart. |
-| C5 | MQ-135 | VOCs + ammonia           | The spoiled-milk punchline sensor. Non-negotiable. |
+| Ch | Pin | Sensor | Target | Why it's in |
+|----|-----|--------|--------|-------------|
+| C0 | A0  | MQ-3   | alcohol / ethanol        | The drinks workhorse (coffee, vinegar, anything fermented). Non-negotiable. |
+| C1 | A1  | MQ-135 | VOCs + ammonia           | The spoiled-milk punchline sensor. Non-negotiable. |
+| C2 | A2  | MQ-2   | broad smoke / VOC        | General-purpose responder; reacts to almost everything — a good baseline dimension. |
+| C3 | A3  | MQ-4   | methane                  | Distinct axis; picks up dairy/fermentation notes differently than the rest. |
+| C4 | A4  | MQ-8   | hydrogen                 | The chemical odd-one-out — responds unlike the others, so it spreads clusters apart. |
+| C5 | A5  | MQ-7   | carbon monoxide          | Different response curve again; cheap extra dimension. |
 
 Feature vector = **6 sensors × 8 features = 48-D per sniff**.
 
@@ -41,7 +41,7 @@ hard-codes 6.
 ## Scope
 
 ### In scope (this milestone)
-- Arduino Uno firmware: scan 6 MQ sensors through a CD74HC4067 mux on one ADC pin,
+- Arduino Uno firmware: read 6 MQ sensors directly on analog pins A0–A5,
   dummy-read + averaging, stream CSV over USB serial at ~20 Hz.
 - Python `serialio`: parse the CSV stream into frames; robust to garbled lines and
   disconnects. A `SimulatedReader` with the identical interface.
@@ -66,10 +66,12 @@ hard-codes 6.
 
 ## Architecture
 
-Approach **A — thin firmware, fat Python**. The Uno does only mux-scan + ADC + CSV
-out (raw counts + timestamp). All calibration and feature math lives in Python, so
-calibration constants (R0, RL) can be tuned and features re-extracted without
-reflashing. The Uno's ~2 KB SRAM cannot hold feature buffers or a model regardless.
+Approach **A — thin firmware, fat Python**. Each MQ module's analog output wires
+directly to one Uno analog pin (A0–A5); the firmware does only ADC + CSV out (raw
+counts + timestamp). With exactly 6 sensors and 6 analog inputs, no multiplexer is
+needed. All calibration and feature math lives in Python, so calibration constants
+(R0, RL) can be tuned and features re-extracted without reflashing. The Uno's ~2 KB
+SRAM cannot hold feature buffers or a model regardless.
 
 ```
  [Uno firmware]  ── CSV "millis,c0,…,c5" @ ~20 Hz ──►  USB serial
@@ -97,8 +99,8 @@ One line per full-array scan, newline-terminated ASCII:
 
 - `millis` — unsigned `millis()` timestamp from the Uno (wraps ~every 49 days; the
   host treats it as monotonic within a session and detects wrap).
-- `c0..c5` — integer raw ADC counts, 0–1023 (Uno 10-bit), one per mux channel C0–C5,
-  each already the average of N samples on-device.
+- `c0..c5` — integer raw ADC counts, 0–1023 (Uno 10-bit), one per analog input A0–A5
+  (channels C0–C5), each already the average of N samples on-device.
 - ~20 Hz (one line per ~50 ms). Field count is always `NCH + 1` (7); the host skips any
   line that doesn't parse to exactly that many integers.
 
@@ -176,14 +178,14 @@ vref = 5.0         # Uno ADC reference volts
 
 [array]
 vcc = 5.0          # sensor supply volts
-# one entry per mux channel C0..C5 — CONFIRM RL against your actual modules
+# one entry per analog input A0..A5 (channels C0..C5) — CONFIRM RL against your actual modules
 channels = [
-  { ch = 0, sensor = "MQ2",   rl = 1000 },
-  { ch = 1, sensor = "MQ3",   rl = 1000 },
-  { ch = 2, sensor = "MQ4",   rl = 1000 },
-  { ch = 3, sensor = "MQ7",   rl = 1000 },
-  { ch = 4, sensor = "MQ8",   rl = 1000 },
-  { ch = 5, sensor = "MQ135", rl = 1000 },
+  { ch = 0, sensor = "MQ3",   rl = 1000 },   # A0
+  { ch = 1, sensor = "MQ135", rl = 1000 },   # A1
+  { ch = 2, sensor = "MQ2",   rl = 1000 },   # A2
+  { ch = 3, sensor = "MQ4",   rl = 1000 },   # A3
+  { ch = 4, sensor = "MQ8",   rl = 1000 },   # A4
+  { ch = 5, sensor = "MQ7",   rl = 1000 },   # A5
 ]
 
 [timing]
@@ -250,17 +252,16 @@ sniffsniff/
 ## Firmware (`firmware/sniffsniff_uno/sniffsniff_uno.ino`)
 
 - `NCH = 6` (channel count constant — the one firmware value tied to array size).
-- Pins: `S0..S3` on `D4,D5,D6,D7`; mux `SIG` on `A0`; mux `EN` tied to GND (active-LOW,
-  always enabled).
-- `selectCh(c)`: write the 4 address bits (LSB = S0).
-- Per channel: set address → `delayMicroseconds(100)` settle → one `analogRead(A0)`
-  discarded → average `N = 16` reads.
+- Pins: the 6 MQ analog outputs wire directly to `A0..A5` in channel order
+  (`A0`=MQ3, `A1`=MQ135, `A2`=MQ2, `A3`=MQ4, `A4`=MQ8, `A5`=MQ7). With exactly 6
+  sensors and 6 analog inputs, no multiplexer is needed.
+- Per channel `c` in wiring order (A0→A5): one `analogRead(A0+c)` discarded (dummy
+  read to let the ADC's sample-and-hold settle) → average `N = 16` reads of the same pin.
 - Print `millis(),c0,…,c5` then `delay(50)` (~20 Hz full scan).
 - No floating-point on-device; raw 10-bit counts only.
 - Header comments document hardware musts: external **5 V ≥3 A** supply for the heaters
   (6 × ~150–180 mA ≈ 0.9–1.1 A; a 2 A+ supply is fine, 3 A leaves headroom), common
-  ground with the Uno, unused mux channels C6–C15 tied to GND, 100 nF VCC→GND on the mux,
-  24–48 h first-power burn-in and 3–5 min warm-up each session.
+  ground with the Uno, 24–48 h first-power burn-in and 3–5 min warm-up each session.
 
 ## Error handling
 
@@ -298,9 +299,9 @@ plain stdout — no heavy TUI dependency in this milestone.
 ## Assumptions to confirm before wiring (not blockers for software)
 
 1. Actual RL value on each module (measure AO→GND unpowered; many are 1 kΩ).
-2. Digital pin assignments `D4–D7` for `S0–S3` (any 4 free digital pins work).
-3. Sensor→channel order in the table is the assumed wiring; match your physical build to it
-   (or edit the config — it only affects feature-column *labels*, since RL cancels in ratios).
+2. Sensor→pin order (`A0`=MQ3, `A1`=MQ135, `A2`=MQ2, `A3`=MQ4, `A4`=MQ8, `A5`=MQ7) is
+   the assumed wiring; match your physical build to it (or edit the config — it only
+   affects feature-column *labels*, since RL cancels in ratios).
 
 ## Handoff to next milestone
 

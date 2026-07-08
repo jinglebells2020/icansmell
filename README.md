@@ -12,14 +12,14 @@ layer are later milestones (see [Roadmap](#roadmap)).
 
 ## The array
 
-| Ch | Sensor | Axis it adds |
-|----|--------|--------------|
-| C0 | MQ-2   | broad smoke / VOC — general responder, baseline dimension |
-| C1 | MQ-3   | alcohol / ethanol — the drinks workhorse |
-| C2 | MQ-4   | methane — dairy/fermentation notes |
-| C3 | MQ-7   | carbon monoxide — different response curve |
-| C4 | MQ-8   | hydrogen — the chemical odd-one-out, spreads clusters |
-| C5 | MQ-135 | VOCs + ammonia — the spoiled-milk sensor |
+| Ch | Pin | Sensor | Axis it adds |
+|----|-----|--------|--------------|
+| C0 | A0  | MQ-3   | alcohol / ethanol — the drinks workhorse |
+| C1 | A1  | MQ-135 | VOCs + ammonia — the spoiled-milk sensor |
+| C2 | A2  | MQ-2   | broad smoke / VOC — general responder, baseline dimension |
+| C3 | A3  | MQ-4   | methane — dairy/fermentation notes |
+| C4 | A4  | MQ-8   | hydrogen — the chemical odd-one-out, spreads clusters |
+| C5 | A5  | MQ-7   | carbon monoxide — different response curve |
 
 The Python pipeline is **channel-count-agnostic** (`N` comes from config), so
 resizing the array is a config edit + the firmware `NCH` constant — not a rewrite.
@@ -42,9 +42,10 @@ resizing the array is a config edit + the firmware `NCH` constant — not a rewr
    labeled dataset on disk  (.npz + manifest.csv)  ── feeds the ML milestone
 ```
 
-Thin firmware, fat Python: the Uno only scans the mux and prints CSV; all
-calibration and feature math lives in Python so you can retune `R0`/`RL` and
-re-extract features without reflashing.
+Thin firmware, fat Python: each MQ module wires directly to an Uno analog pin
+(A0–A5) and the Uno only reads A0–A5 and prints CSV; all calibration and feature
+math lives in Python so you can retune `R0`/`RL` and re-extract features without
+reflashing. With 6 sensors and 6 analog inputs, no multiplexer is needed.
 
 ## Quickstart (no hardware needed)
 
@@ -86,9 +87,9 @@ Each sniff is one `data/<label>/<label>_NNNN.npz` holding `raw` `[T,6]`, `t_ms`
 
 ## Firmware
 
-`firmware/sniffsniff_uno/sniffsniff_uno.ino` — scans C0–C5 through a CD74HC4067
-mux on `A0`, dummy-read + 16× averaging, prints `millis(),c0,…,c5` at ~20 Hz.
-Compiles for `arduino:avr:uno` (2.4 KB flash / 7%, 184 B SRAM / 8%).
+`firmware/sniffsniff_uno/sniffsniff_uno.ino` — reads C0–C5 directly on analog pins
+`A0`–`A5` (in wiring order), dummy-read + 16× averaging, prints `millis(),c0,…,c5`
+at ~20 Hz. Compiles for `arduino:avr:uno` (2.4 KB flash / 7%, 184 B SRAM / 8%).
 
 ```bash
 arduino-cli compile --fqbn arduino:avr:uno firmware/sniffsniff_uno
@@ -97,8 +98,18 @@ arduino-cli upload  --fqbn arduino:avr:uno -p /dev/ttyACM0 firmware/sniffsniff_u
 
 ### Wiring / hardware musts
 
-- **Mux:** S0–S3 → D4–D7, SIG → A0, EN → GND. Unused mux channels C6–C15 → GND.
-  100 nF cap VCC→GND on the mux.
+- **Sensors → analog pins (direct, no multiplexer):** each MQ module's AO output goes
+  straight to one Uno analog pin. With 6 sensors and 6 analog inputs, no mux is needed.
+
+  | Pin | Sensor | Ch |
+  |-----|--------|----|
+  | A0  | MQ-3   | C0 |
+  | A1  | MQ-135 | C1 |
+  | A2  | MQ-2   | C2 |
+  | A3  | MQ-4   | C3 |
+  | A4  | MQ-8   | C4 |
+  | A5  | MQ-7   | C5 |
+
 - **Power:** heaters draw ~1 A total (6 × ~150–180 mA) — use an **external 5 V ≥ 3 A**
   supply for the sensors, common ground with the Uno. The Uno's regulator cannot feed them.
 - **Burn-in:** 24–48 h continuous power on first use; 3–5 min warm-up each session.

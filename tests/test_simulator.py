@@ -30,31 +30,40 @@ def test_odor_profiles_present_and_shaped():
         "spoiled_milk",
     }
     assert required <= set(ODOR_PROFILES)
-    for name, gain in ODOR_PROFILES.items():
-        g = np.asarray(gain)
-        assert g.shape == (6,), f"{name} gain must be a 6-vector"
-        assert np.all(g >= 0.0), f"{name} gains must be non-negative"
+    # Each profile is now a {sensor_name: gain} mapping.
+    for name, profile in ODOR_PROFILES.items():
+        assert isinstance(profile, dict), f"{name} profile must be a dict"
+        for sensor, gain in profile.items():
+            assert isinstance(sensor, str), f"{name} keys must be sensor names"
+            assert isinstance(gain, float), f"{name}[{sensor}] gain must be a float"
+            assert gain >= 0.0, f"{name}[{sensor}] gain must be non-negative"
 
 
 def test_clean_air_is_all_zero_gain():
-    assert np.allclose(ODOR_PROFILES["clean_air"], 0.0)
+    # clean_air has no per-sensor gains: an empty mapping -> zero everywhere.
+    assert ODOR_PROFILES["clean_air"] == {}
 
 
-def test_alcohol_dominant_on_mq3_idx1():
-    g = np.asarray(ODOR_PROFILES["alcohol"])
-    assert np.argmax(g) == 1  # MQ3
+def test_alcohol_dominant_on_mq3():
+    names = default_config().sensor_names()
+    idx = names.index("MQ3")
+    g = Simulator(default_config(), seed=0)._gain("alcohol")
+    assert np.argmax(g) == idx
 
 
-def test_vinegar_and_spoiled_milk_high_on_mq135_idx5():
-    assert np.argmax(np.asarray(ODOR_PROFILES["vinegar"])) == 5
-    assert np.argmax(np.asarray(ODOR_PROFILES["spoiled_milk"])) == 5
+def test_vinegar_and_spoiled_milk_high_on_mq135():
+    names = default_config().sensor_names()
+    idx = names.index("MQ135")
+    sim = Simulator(default_config(), seed=0)
+    assert np.argmax(sim._gain("vinegar")) == idx
+    assert np.argmax(sim._gain("spoiled_milk")) == idx
 
 
 def test_fresh_vs_spoiled_milk_differ_on_dairy_axes():
-    fresh = np.asarray(ODOR_PROFILES["fresh_milk"])
-    spoiled = np.asarray(ODOR_PROFILES["spoiled_milk"])
-    # they must genuinely differ on idx2/idx3/idx4 (MQ4/MQ7/MQ8)
-    assert not np.allclose(fresh[2:5], spoiled[2:5])
+    fresh = ODOR_PROFILES["fresh_milk"]
+    spoiled = ODOR_PROFILES["spoiled_milk"]
+    # they must genuinely differ on the dairy axes (MQ4/MQ7/MQ8)
+    assert any(fresh[s] != spoiled[s] for s in ("MQ4", "MQ7", "MQ8"))
 
 
 # --- Frame shape / count / timing --------------------------------------------
@@ -167,8 +176,9 @@ def test_odor_pulls_fractional_negative():
     cfg = default_config()
     sim = Simulator(cfg, seed=0, noise_counts=0.0)
     y = _plateau_fractional(cfg, sim.sniff_frames("alcohol"))
-    # MQ3 (idx1) is the alcohol responder; it should be clearly negative
-    assert y[1] < -0.05
+    # MQ3 is the alcohol responder; its channel should be clearly negative
+    idx = cfg.sensor_names().index("MQ3")
+    assert y[idx] < -0.05
 
 
 def test_unknown_odor_raises():

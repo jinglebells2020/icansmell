@@ -16,10 +16,12 @@ Per-sensor model (see the Foundation design spec):
 * Additive Gaussian noise in *counts* from a seeded ``numpy.random.Generator``,
   making every session byte-reproducible for a given seed.
 
-The gain vectors in :data:`ODOR_PROFILES` are fixed 6-vectors aligned to the
-canonical sensor order ``[MQ2, MQ3, MQ4, MQ7, MQ8, MQ135]``. Everything else is
+The gains in :data:`ODOR_PROFILES` are keyed by *sensor name* (e.g. ``"MQ3"``),
+not channel position, so the simulator produces the same odor chemistry no
+matter what order the sensors are wired into the config. Everything else is
 channel-count-agnostic: the frame width and default ``r_base`` derive from
-``config.n_channels``, and gain vectors are sliced to ``N`` channels.
+``config.n_channels``, and the per-channel gain vector is assembled from the
+config's ``sensor_names()`` (unknown sensors default to zero gain).
 """
 from __future__ import annotations
 
@@ -33,25 +35,26 @@ from .config import Config
 __all__ = ["ODOR_PROFILES", "Simulator", "SimulatedReader"]
 
 
-# Gain vectors aligned to canonical channel order:
-#   idx 0=MQ2, 1=MQ3, 2=MQ4, 3=MQ7, 4=MQ8, 5=MQ135
+# Per-odor multiplicative gains keyed by sensor NAME (not channel position), so
+# the simulator is agnostic to how sensors are wired into the config order.
 # Chosen for separability:
-#   * alcohol dominant on MQ3 (idx1)
-#   * vinegar & spoiled_milk dominant on MQ135 (idx5)
+#   * alcohol dominant on MQ3
+#   * vinegar & spoiled_milk dominant on MQ135
 #   * coffee broad / moderate across the array
-#   * fresh vs spoiled milk pulled apart via MQ4/MQ7/MQ8 (idx2/3/4)
-ODOR_PROFILES: dict[str, np.ndarray] = {
-    "clean_air": np.zeros(6, dtype=np.float64),
+#   * fresh vs spoiled milk pulled apart via MQ4/MQ7/MQ8
+# Unknown sensors default to 0 gain (see Simulator._gain). clean_air is empty.
+ODOR_PROFILES: dict[str, dict[str, float]] = {
+    "clean_air": {},
     # broad responder, moderate everywhere, MQ2/MQ135 a touch higher
-    "coffee": np.array([0.9, 0.6, 0.4, 0.3, 0.35, 0.7], dtype=np.float64),
+    "coffee": {"MQ2": 0.9, "MQ3": 0.6, "MQ4": 0.4, "MQ7": 0.3, "MQ8": 0.35, "MQ135": 0.7},
     # acetic acid: strong on MQ135 (VOC/ammonia), modest MQ2/MQ3
-    "vinegar": np.array([0.4, 0.5, 0.2, 0.2, 0.2, 1.4], dtype=np.float64),
+    "vinegar": {"MQ2": 0.4, "MQ3": 0.5, "MQ4": 0.2, "MQ7": 0.2, "MQ8": 0.2, "MQ135": 1.4},
     # ethanol: dominant on MQ3, some MQ2 smoke/VOC bleed
-    "alcohol": np.array([0.6, 1.6, 0.3, 0.2, 0.3, 0.4], dtype=np.float64),
+    "alcohol": {"MQ2": 0.6, "MQ3": 1.6, "MQ4": 0.3, "MQ7": 0.2, "MQ8": 0.3, "MQ135": 0.4},
     # fresh milk: mild, leans on the methane axis (MQ4), low MQ135
-    "fresh_milk": np.array([0.3, 0.2, 0.7, 0.5, 0.2, 0.3], dtype=np.float64),
+    "fresh_milk": {"MQ2": 0.3, "MQ3": 0.2, "MQ4": 0.7, "MQ7": 0.5, "MQ8": 0.2, "MQ135": 0.3},
     # spoiled milk: MQ135 punchline + H2/CO shift (MQ8/MQ7), less MQ4 than fresh
-    "spoiled_milk": np.array([0.5, 0.3, 0.3, 0.8, 0.7, 1.2], dtype=np.float64),
+    "spoiled_milk": {"MQ2": 0.5, "MQ3": 0.3, "MQ4": 0.3, "MQ7": 0.8, "MQ8": 0.7, "MQ135": 1.2},
 }
 
 
@@ -95,20 +98,20 @@ class Simulator:
         self.tau_decay = 20.0
 
     def _gain(self, odor: str) -> np.ndarray:
-        """Per-channel gain for ``odor``, sliced/broadcast to ``N`` channels.
+        """Per-channel gain vector for ``odor``, aligned to the config's channel order.
 
-        Gain vectors are canonical 6-vectors; for an ``N``-channel config we take
-        the first ``N`` entries (``N <= 6``) or tile if a larger array is ever
-        configured, keeping the simulator channel-count-agnostic.
+        The profile is a ``{sensor_name: gain}`` mapping; we assemble the vector
+        by looking each channel's sensor name up in the profile, defaulting
+        unknown sensors to zero gain. This makes the simulator produce the same
+        odor chemistry regardless of channel order (order- and name-agnostic).
         """
         if odor not in ODOR_PROFILES:
             raise KeyError(f"unknown odor {odor!r}; known: {sorted(ODOR_PROFILES)}")
-        base = ODOR_PROFILES[odor]
-        n = self.config.n_channels
-        if n <= base.shape[0]:
-            return base[:n].astype(np.float64)
-        reps = int(np.ceil(n / base.shape[0]))
-        return np.tile(base, reps)[:n].astype(np.float64)
+        profile = ODOR_PROFILES[odor]
+        return np.array(
+            [profile.get(name, 0.0) for name in self.config.sensor_names()],
+            dtype=np.float64,
+        )
 
     def sniff_frames(self, odor: str) -> list[tuple[int, np.ndarray]]:
         """Simulate a full three-phase session for ``odor``.

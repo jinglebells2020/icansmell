@@ -6,7 +6,7 @@ from sniffsniff.config import Channel, Config, default_config, load_config
 
 REPO_TOML = "sniffsniff.toml"  # resolved relative to repo root below
 
-EXPECTED_SENSORS = ["MQ2", "MQ3", "MQ4", "MQ7", "MQ8", "MQ135"]
+EXPECTED_SENSORS = ["MQ3", "MQ135", "MQ2", "MQ4", "MQ8", "MQ7"]
 
 
 def _repo_root():
@@ -182,12 +182,12 @@ def test_load_config_accepts_valid_reordered(tmp_path):
     # ch values {0..5} but listed out of order — should be accepted and re-sorted
     block = """
 channels = [
-  { ch = 2, sensor = "MQ4",   rl = 1000 },
-  { ch = 0, sensor = "MQ2",   rl = 1000 },
-  { ch = 5, sensor = "MQ135", rl = 1000 },
-  { ch = 1, sensor = "MQ3",   rl = 1000 },
+  { ch = 2, sensor = "MQ2",   rl = 1000 },
+  { ch = 0, sensor = "MQ3",   rl = 1000 },
+  { ch = 5, sensor = "MQ7",   rl = 1000 },
+  { ch = 1, sensor = "MQ135", rl = 1000 },
   { ch = 4, sensor = "MQ8",   rl = 1000 },
-  { ch = 3, sensor = "MQ7",   rl = 1000 },
+  { ch = 3, sensor = "MQ4",   rl = 1000 },
 ]
 """
     p = _write_toml(tmp_path, block)

@@ -7,14 +7,15 @@ vref = 5.0         # Uno ADC reference volts
 
 [array]
 vcc = 5.0          # sensor supply volts
-# one entry per mux channel C0..C5 — CONFIRM RL against your actual modules
+# one entry per channel C0..C5 — direct wiring, each module's AO -> an Uno analog pin
+# (A0=ch0, A1=ch1, A2=ch2, A3=ch3, A4=ch4, A5=ch5; no multiplexer)
 channels = [
-  { ch = 0, sensor = "MQ2",   rl = 1000 },
-  { ch = 1, sensor = "MQ3",   rl = 1000 },
-  { ch = 2, sensor = "MQ4",   rl = 1000 },
-  { ch = 3, sensor = "MQ7",   rl = 1000 },
+  { ch = 0, sensor = "MQ3",   rl = 1000 },
+  { ch = 1, sensor = "MQ135", rl = 1000 },
+  { ch = 2, sensor = "MQ2",   rl = 1000 },
+  { ch = 3, sensor = "MQ4",   rl = 1000 },
   { ch = 4, sensor = "MQ8",   rl = 1000 },
-  { ch = 5, sensor = "MQ135", rl = 1000 },
+  { ch = 5, sensor = "MQ7",   rl = 1000 },
 ]
 
 [timing]

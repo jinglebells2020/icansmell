@@ -5,7 +5,7 @@ The device streams one CSV line per full-array scan::
     <millis>,<c0>,<c1>,...,<c(N-1)>\\n
 
 ``parse_line`` turns such a line into a ``(t_ms, raw)`` frame, where ``raw`` is
-an ``int64`` array of ADC counts in mux-channel order. It is channel-count-
+an ``int64`` array of ADC counts in channel order. It is channel-count-
 agnostic: the number of channels is a parameter, and the default of ``6`` is only
 this build's array size — nothing here hard-codes 6 structurally.
 
@@ -41,7 +41,7 @@ def parse_line(line: str, n_channels: int = 6) -> Optional[tuple[int, np.ndarray
     fields, each a base-10 integer: a ``millis`` timestamp followed by
     ``n_channels`` ADC counts. Any deviation — wrong field count, a non-integer
     field, an empty/blank line — yields ``None`` so the caller can skip it
-    without crashing. ``raw`` is ``int64`` in mux-channel order 0..N-1.
+    without crashing. ``raw`` is ``int64`` in channel order 0..N-1.
 
     Note: values are not range-checked against 0..1023; a hardware channel that
     rails is still a valid integer here and is flagged downstream, not dropped.
