@@ -37,7 +37,7 @@ def capture_session(
     config: Config,
     *,
     on_phase: Optional[Callable[[str, int, int], None]] = None,
-    on_frame: Optional[Callable[[int, int, str], None]] = None,
+    on_frame: Optional[Callable[[int, int, str, tuple], None]] = None,
 ) -> list:
     """Capture exactly one session's frames from ``reader``, then stop.
 
@@ -47,8 +47,8 @@ def capture_session(
     disconnect), the frames captured so far are returned — never padded, never hung.
 
     ``on_phase(phase, k, n)`` fires once at each phase transition (baseline →
-    exposure → purge); ``on_frame(k, n, phase)`` fires for every captured frame.
-    The reader is closed when capture finishes.
+    exposure → purge); ``on_frame(k, n, phase, frame)`` fires for every captured
+    frame (``frame`` is the ``(t_ms, raw)`` tuple). The reader is closed when done.
     """
     n = session_frame_count(config)
     slices = phase_slices(n, config)
@@ -69,7 +69,7 @@ def capture_session(
                 if on_phase is not None:
                     on_phase(phase, k, n)
             if on_frame is not None:
-                on_frame(k, n, phase)
+                on_frame(k, n, phase, frame)
     finally:
         try:
             reader.close()

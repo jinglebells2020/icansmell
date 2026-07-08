@@ -49,7 +49,7 @@ def _make_ticker(cfg: Config):
     """A per-frame callback that prints a once-per-second elapsed/total line."""
     hz = max(1, cfg.scan_hz)
 
-    def tick(k: int, n: int, phase: str) -> None:
+    def tick(k: int, n: int, phase: str, frame=None) -> None:
         if k % hz == 0:
             print(f"\r    [{k // hz:3d}s / {n // hz:3d}s]  {phase:8s}", end="", flush=True)
 
@@ -298,6 +298,30 @@ def _cmd_identify(args) -> int:
     return 0
 
 
+def _cmd_tui(args) -> int:
+    """Launch the interactive Textual TUI over a SniffController."""
+    from .tui.controller import SniffController
+
+    cfg = _load(args.config)
+    controller = SniffController(
+        cfg,
+        out_dir=args.out,
+        use_sim=args.sim,
+        port=args.port,
+        seed=args.seed,
+        model_path=args.model,
+    )
+
+    try:
+        from .tui.app import run_tui
+    except ImportError:
+        print("the TUI needs textual: pip install sniffsniff[tui]")
+        return 1
+
+    run_tui(controller, reps=args.reps, label=args.label)
+    return 0
+
+
 def _add_dataset_source_args(parser) -> None:
     """Shared ``--data``/``--sim`` dataset-source flags for fit/map."""
     parser.add_argument("--data", default=None, help="dataset dir of recorded sniffs")
@@ -363,6 +387,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_id.add_argument("--seed", type=int, default=0)
     p_id.add_argument("--json", action="store_true", help="also emit geometry JSON")
     p_id.set_defaults(func=_cmd_identify)
+
+    p_tui = sub.add_parser("tui", help="launch the interactive Textual console")
+    p_tui.add_argument("--sim", action="store_true", help="use the simulator")
+    p_tui.add_argument(
+        "--port", default="/dev/cu.usbmodem101", help="serial port"
+    )
+    p_tui.add_argument("--config", default=None, help="path to a config TOML")
+    p_tui.add_argument("--out", default="data", help="output directory")
+    p_tui.add_argument("--model", default="model.joblib", help="model path")
+    p_tui.add_argument("--reps", type=int, default=8, help="sniffs per record")
+    p_tui.add_argument("--label", default="coffee", help="default record label")
+    p_tui.add_argument("--seed", type=int, default=0)
+    p_tui.set_defaults(func=_cmd_tui)
 
     return parser
 

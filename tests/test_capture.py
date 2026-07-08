@@ -63,7 +63,7 @@ def test_capture_invokes_on_frame_for_every_frame():
     cfg = _short()
     reader = SimulatedReader(Simulator(cfg, seed=0).sniff_frames("coffee"))
     ticks = []
-    capture_session(reader, cfg, on_frame=lambda k, n, ph: ticks.append(k))
+    capture_session(reader, cfg, on_frame=lambda k, n, ph, fr: ticks.append(k))
     assert ticks == list(range(session_frame_count(cfg)))
 
 
