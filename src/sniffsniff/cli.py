@@ -5,6 +5,9 @@ Subcommands:
 * ``stream``   — print a few fractional frames from the live/sim source.
 * ``record``   — capture one sniff and persist it (``--label`` required).
 * ``simulate`` — print a per-odor plateau fractional summary from the simulator.
+* ``fit``      — build a labeled dataset (disk or ``--sim``) and fit a SmellModel.
+* ``map``      — render the 2-D PCA smell map (PNG) for a fitted model.
+* ``identify`` — capture/simulate one sniff and print its predicted odor + novelty.
 
 ``--sim`` selects the :mod:`sniffsniff.simulator` path; otherwise a real
 :class:`sniffsniff.serialio.SerialReader` is used. The pipeline is
@@ -122,6 +125,131 @@ def _cmd_record(args) -> int:
     return 0
 
 
+# The five non-clean-air odors the simulator knows — the default sim classes for
+# fit/map. ``clean_air`` is the baseline, not an odor to identify against.
+_DEFAULT_SIM_ODORS = ["coffee", "vinegar", "alcohol", "fresh_milk", "spoiled_milk"]
+
+
+def _build_dataset(args, cfg: Config):
+    """Build a :class:`~sniffsniff.dataset.Dataset` from ``--data`` or ``--sim``.
+
+    ``--sim`` synthesises one via the simulator (``--odors``/``--reps``/``--seed``);
+    otherwise ``--data DIR`` loads recorded ``.npz`` sniffs off disk. Returns
+    ``(dataset, source)`` where ``source`` is ``"sim"`` or ``"real"`` (used to
+    honestly label the reported accuracy).
+    """
+    from . import dataset as dataset_mod
+
+    if getattr(args, "sim", False):
+        if args.odors:
+            odors = [o.strip() for o in args.odors.split(",") if o.strip()]
+        else:
+            odors = list(_DEFAULT_SIM_ODORS)
+        ds = dataset_mod.simulate_dataset(
+            cfg, odors, args.reps, seed=args.seed
+        )
+        return ds, "sim"
+
+    if not args.data:
+        raise SystemExit("one of --data DIR or --sim is required")
+    ds = dataset_mod.load_dataset(args.data)
+    return ds, "real"
+
+
+def _cmd_fit(args) -> int:
+    """Fit a SmellModel from a simulated or recorded dataset and save it."""
+    from .model import SmellModel, cross_val_accuracy
+
+    cfg = _load(args.config)
+    ds, source = _build_dataset(args, cfg)
+    if ds.X.shape[0] == 0:
+        print("no samples in dataset; nothing to fit")
+        return 1
+
+    model = SmellModel(classifier=args.classifier)
+    model.fit(ds.X, ds.y)
+    # Carry the column names so geometry/identify can label features by name.
+    model.feature_names_ = list(ds.feature_names)
+
+    mean, std = cross_val_accuracy(
+        ds.X, ds.y, classifier=args.classifier, groups=ds.ids
+    )
+    print(
+        f"cross-validated accuracy ({source}): "
+        f"{mean:.3f} ± {std:.3f} "
+        f"({len(ds.classes)} classes, n={ds.X.shape[0]})"
+    )
+
+    model.save(args.out)
+    print(f"saved model: {args.out}")
+    return 0
+
+
+def _cmd_map(args) -> int:
+    """Render the 2-D PCA smell map to a PNG for a fitted model."""
+    from .model import SmellModel
+    from .smellmap import render_map
+
+    cfg = _load(args.config)
+    model = SmellModel.load(args.model)
+    ds, _ = _build_dataset(args, cfg)
+    saved = render_map(model, ds, path=args.out)
+    print(f"saved map: {saved}")
+    return 0
+
+
+def _cmd_identify(args) -> int:
+    """Capture/simulate one sniff, print predicted odor + probability + novelty."""
+    import json as _json
+
+    from .model import SmellModel
+    from .geometry import serialize_geometry
+
+    cfg = _load(args.config)
+    model = SmellModel.load(args.model)
+
+    reader = _make_reader(args, cfg)
+    frames = _collect_frames(reader)
+    if not frames:
+        print("no frames captured; nothing to identify")
+        return 1
+
+    # Label is only bookkeeping for the recorder; identity comes from the model.
+    label = getattr(args, "odor", None) or "unknown"
+    result = SniffRecorder(cfg, ".").process(frames, label)
+    feats = result.features
+
+    feats_2d = feats.reshape(1, -1)
+    classes, proba = model.predict_proba(feats_2d)
+    proba_row = np.asarray(proba)[0]
+    pred_idx = int(np.argmax(proba_row))
+    pred_label = str(classes[pred_idx])
+    pred_proba = float(proba_row[pred_idx])
+    novelty = float(model.novelty(feats_2d)[0])
+    is_novel = bool(model.is_novel(feats_2d)[0])
+
+    print(f"predicted: {pred_label}  (proba={pred_proba:.3f})")
+    print(
+        f"novelty: {novelty:.3f}  "
+        f"(threshold={model.novelty_threshold_:.3f}, is_novel={is_novel})"
+    )
+    if args.json:
+        print(_json.dumps(serialize_geometry(model, new_sample=feats)))
+    return 0
+
+
+def _add_dataset_source_args(parser) -> None:
+    """Shared ``--data``/``--sim`` dataset-source flags for fit/map."""
+    parser.add_argument("--data", default=None, help="dataset dir of recorded sniffs")
+    parser.add_argument("--sim", action="store_true", help="synthesise via simulator")
+    parser.add_argument(
+        "--odors", default=None, help="comma-separated odors for --sim"
+    )
+    parser.add_argument("--reps", type=int, default=8, help="sniffs per odor for --sim")
+    parser.add_argument("--config", default=None, help="path to a config TOML")
+    parser.add_argument("--seed", type=int, default=0)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sniffsniff", description="6-sensor MQ e-nose")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -149,6 +277,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_sim.add_argument("--config", default=None, help="path to a config TOML")
     p_sim.add_argument("--seed", type=int, default=0)
     p_sim.set_defaults(func=_cmd_simulate)
+
+    p_fit = sub.add_parser("fit", help="fit a SmellModel from a dataset")
+    _add_dataset_source_args(p_fit)
+    p_fit.add_argument("--classifier", default="knn", help="knn|svm|rf|lda")
+    p_fit.add_argument("--out", default="model.joblib", help="model output path")
+    p_fit.set_defaults(func=_cmd_fit)
+
+    p_map = sub.add_parser("map", help="render the PCA smell map to a PNG")
+    p_map.add_argument("--model", required=True, help="fitted model.joblib")
+    _add_dataset_source_args(p_map)
+    p_map.add_argument("--out", default=None, help="PNG output path")
+    p_map.set_defaults(func=_cmd_map)
+
+    p_id = sub.add_parser("identify", help="identify one sniff against a model")
+    p_id.add_argument("--model", required=True, help="fitted model.joblib")
+    p_id.add_argument("--sim", action="store_true", help="use the simulator")
+    p_id.add_argument("--odor", default=None, help="odor to simulate for --sim")
+    p_id.add_argument("--port", default="/dev/ttyUSB0", help="serial port")
+    p_id.add_argument("--config", default=None, help="path to a config TOML")
+    p_id.add_argument("--seed", type=int, default=0)
+    p_id.add_argument("--json", action="store_true", help="also emit geometry JSON")
+    p_id.set_defaults(func=_cmd_identify)
 
     return parser
 
