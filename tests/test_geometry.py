@@ -81,16 +81,34 @@ def test_serialize_geometry_is_json_serializable(model):
     text = json.dumps(geo)
     assert isinstance(text, str)
     # round-trips
-    assert json.loads(text)["pca"]["n_components"] == 2
+    assert json.loads(text)["pca"]["map_components"] == 2
 
 
 def test_serialize_geometry_pca_block(model):
     geo = serialize_geometry(model)
     pca = geo["pca"]
-    assert pca["n_components"] == 2
-    assert isinstance(pca["explained_variance_ratio"], list)
-    assert len(pca["explained_variance_ratio"]) == 2
-    assert all(isinstance(v, float) for v in pca["explained_variance_ratio"])
+    assert pca["map_components"] == 2
+    assert pca["working_components"] == 2  # this fixture fits with n_components=2
+    assert isinstance(pca["map_explained_variance_ratio"], list)
+    assert len(pca["map_explained_variance_ratio"]) == 2
+    assert all(isinstance(v, float) for v in pca["map_explained_variance_ratio"])
+    assert isinstance(pca["total_explained_variance"], float)
+
+
+def test_map_stays_2d_while_working_space_is_higher():
+    # Decoupling: classifier/novelty use k>2 PCs, but the map (centroids, coords,
+    # axes) stays 2-D so the picture and the LLM's spatial story remain 2-D.
+    ds = simulate_dataset(default_config(), ODORS, reps=8, seed=3)
+    m = SmellModel(n_components=5, classifier="knn").fit(ds.X, ds.y)
+    m.feature_names_ = list(ds.feature_names)
+    geo = serialize_geometry(m, new_sample=ds.X[0])
+    assert m.n_components_ == 5                      # full working space
+    assert geo["pca"]["working_components"] == 5
+    assert geo["pca"]["map_components"] == 2
+    assert len(geo["axis_interpretation"]) == 2      # only the 2 map axes named
+    for entry in geo["known_clusters"].values():
+        assert len(entry["centroid"]) == 2           # map centroid is 2-D
+    assert len(geo["new_sample"]["pca_coords"]) == 2 # map coords are 2-D
 
 
 def test_serialize_geometry_known_clusters(model):

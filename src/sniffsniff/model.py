@@ -60,17 +60,25 @@ class SmellModel:
     Parameters
     ----------
     n_components:
-        Number of PCA components ``k`` (the map dimensionality).
+        Requested number of PCA components ``k`` — the working space for the
+        classifier and the Mahalanobis novelty test. Default 5: the 2-D map (first
+        two PCs) is great for *looking* at, but classifying/novelty-testing in only
+        2-D throws away most of the variance, so identity + novelty use more PCs.
+        The first two components are still the map (see ``MAP_DIMS``). ``k`` is
+        clamped at fit time to ``min(k, n_features, n_samples - 1)``.
     classifier:
         One of ``{"knn", "svm", "rf", "lda"}``.
     novelty_alpha:
         Chi-squared confidence level for the novelty threshold; the threshold is
-        ``sqrt(chi2.ppf(novelty_alpha, df=n_components))``.
+        ``sqrt(chi2.ppf(novelty_alpha, df=k))`` where ``k`` is the fitted component count.
     """
+
+    #: Number of PCA components used for the 2-D "smell map" (visualisation).
+    MAP_DIMS: int = 2
 
     def __init__(
         self,
-        n_components: int = 2,
+        n_components: int = 5,
         classifier: str = "knn",
         novelty_alpha: float = 0.975,
     ):
@@ -83,12 +91,16 @@ class SmellModel:
         """Fit scaler, PCA, classifier, and per-class Mahalanobis statistics."""
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=str)
-        n_samples = X.shape[0]
+        n_samples, n_features = X.shape
+
+        # Clamp components to what the data can support (PCA needs k <= min(n, p);
+        # covariances need headroom). n_components_ is the fitted working dimension.
+        self.n_components_ = max(1, min(self.n_components, n_features, n_samples - 1))
 
         self.scaler_ = StandardScaler().fit(X)
         scaled = self.scaler_.transform(X)
 
-        self.pca_ = PCA(n_components=self.n_components, random_state=0).fit(scaled)
+        self.pca_ = PCA(n_components=self.n_components_, random_state=0).fit(scaled)
         scores = self.pca_.transform(scaled)
 
         self.clf_ = _make_classifier(self.classifier, n_samples)
@@ -103,7 +115,7 @@ class SmellModel:
             pooled_cov = np.cov(scores.T)
             pooled_cov = np.atleast_2d(pooled_cov)
         else:
-            pooled_cov = np.eye(self.n_components)
+            pooled_cov = np.eye(self.n_components_)
         pooled_cov_inv = np.linalg.pinv(pooled_cov)
 
         self.centroids_: dict[str, np.ndarray] = {}
@@ -120,14 +132,14 @@ class SmellModel:
             self.counts_[label] = int(member.shape[0])
 
             # Own covariance only if the class has enough members; else pooled.
-            if member.shape[0] >= self.n_components + 1:
+            if member.shape[0] >= self.n_components_ + 1:
                 cov = np.atleast_2d(np.cov(member.T))
                 self.cov_inv_[label] = np.linalg.pinv(cov)
             else:
                 self.cov_inv_[label] = pooled_cov_inv
 
         self.novelty_threshold_ = float(
-            np.sqrt(chi2.ppf(self.novelty_alpha, df=self.n_components))
+            np.sqrt(chi2.ppf(self.novelty_alpha, df=self.n_components_))
         )
         return self
 
@@ -187,7 +199,7 @@ def cross_val_accuracy(
     X,
     y,
     *,
-    n_components: int = 2,
+    n_components: int = 5,
     classifier: str = "knn",
     groups=None,
 ) -> tuple[float, float]:
@@ -200,15 +212,25 @@ def cross_val_accuracy(
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=str)
-    n_samples = X.shape[0]
+    n_samples, n_features = X.shape
 
     _, counts = np.unique(y, return_counts=True)
     min_class_count = int(counts.min())
 
+    # Clamp so PCA stays valid inside the smallest CV fold's training split.
+    if groups is not None:
+        n_splits = min(5, len(set(np.asarray(groups).tolist())))
+    elif min_class_count < 3:
+        n_splits = n_samples  # LeaveOneOut
+    else:
+        n_splits = min(5, min_class_count)
+    min_train = n_samples - int(np.ceil(n_samples / n_splits))
+    k = max(1, min(n_components, n_features, max(1, min_train)))
+
     pipeline = Pipeline(
         [
             ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=n_components, random_state=0)),
+            ("pca", PCA(n_components=k, random_state=0)),
             ("clf", _make_classifier(classifier, n_samples)),
         ]
     )

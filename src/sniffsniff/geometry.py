@@ -46,50 +46,63 @@ def axis_interpretation(model, *, top_k: int = 3) -> dict[str, str]:
 def serialize_geometry(model, *, new_sample=None) -> dict:
     """Serialize the model geometry (and an optional new sample) to M3 JSON.
 
-    The returned dict is fully JSON-serializable (plain python scalars/lists):
+    The returned dict is fully JSON-serializable (plain python scalars/lists).
+    The *map* is the first two PCs (what gets plotted and reasoned over spatially);
+    identity and novelty use the full ``k``-D working space.
 
-    * ``pca``: ``n_components`` and ``explained_variance_ratio``.
-    * ``axis_interpretation``: per-PC dominant-feature strings.
-    * ``known_clusters``: per label ``{centroid, radius, n[, distance]}`` in PCA
-      space; ``distance`` (Euclidean from the new sample's PCA coords to the
-      centroid) is present only when ``new_sample`` is given.
-    * ``new_sample`` (only when given): ``pca_coords``, ``predicted{label, proba}``
-      and ``top_features_z`` (the standardized features with the largest ``|z|``).
+    * ``pca``: ``map_components`` (2), ``working_components`` (``k``),
+      ``map_explained_variance_ratio`` (first two PCs) and ``total_explained_variance``.
+    * ``axis_interpretation``: dominant-feature strings for the two map axes.
+    * ``known_clusters``: per label ``{centroid, radius, n[, distance]}`` in the 2-D
+      map; ``distance`` (Euclidean from the new sample's map coords to the centroid)
+      is present only when ``new_sample`` is given.
+    * ``new_sample`` (only when given): ``pca_coords`` (2-D map), ``predicted{label,
+      proba}`` (full-space classifier) and ``top_features_z`` (largest ``|z|``).
     * ``novelty``: ``min_mahalanobis``, ``threshold``, ``is_novel`` and the
-      ``nearest`` cluster (min per-class Mahalanobis).
+      ``nearest`` cluster (min per-class Mahalanobis, in the full ``k``-D space).
 
     ``new_sample`` is a single ``(48,)`` raw feature vector.
     """
     evr = [float(v) for v in np.asarray(model.explained_variance_ratio_).tolist()]
+    k = int(getattr(model, "n_components_", model.n_components))
+    # The map is the first MAP_DIMS PCs; identity/novelty use the full k-D space.
+    m = min(int(getattr(model, "MAP_DIMS", 2)), k)
+
+    # Only the map axes get a spatial interpretation (they are what's plotted and
+    # what the LLM reasons over positionally).
+    all_axes = axis_interpretation(model)
+    map_axes = {f"PC{i + 1}": all_axes[f"PC{i + 1}"] for i in range(m)}
 
     geo: dict = {
         "pca": {
-            "n_components": int(model.n_components),
-            "explained_variance_ratio": evr,
+            "map_components": m,
+            "working_components": k,
+            "map_explained_variance_ratio": evr[:m],
+            "total_explained_variance": float(sum(evr)),
         },
-        "axis_interpretation": axis_interpretation(model),
+        "axis_interpretation": map_axes,
         "known_clusters": {},
         "novelty": {},
     }
 
     # ---------------------------------------------------------- new sample prep
-    sample_scores = None
+    sample_scores = None       # full k-D scores (for novelty/prediction)
+    sample_map = None          # first m dims (for the 2-D map story)
     if new_sample is not None:
         x = np.asarray(new_sample, dtype=np.float64).reshape(1, -1)
         sample_scores = model.transform(x)[0]  # (k,)
+        sample_map = sample_scores[:m]
 
-    # ---------------------------------------------------------- known clusters
+    # ---------------------------------------------- known clusters (map, 2-D)
     for label in model.classes_:
-        centroid = np.asarray(model.centroids_[label], dtype=np.float64)
+        centroid = np.asarray(model.centroids_[label], dtype=np.float64)[:m]
         entry = {
             "centroid": [float(c) for c in centroid.tolist()],
             "radius": float(model.radii_[label]),
             "n": int(model.counts_[label]),
         }
-        if sample_scores is not None:
-            entry["distance"] = float(
-                np.linalg.norm(sample_scores - centroid)
-            )
+        if sample_map is not None:
+            entry["distance"] = float(np.linalg.norm(sample_map - centroid))
         geo["known_clusters"][label] = entry
 
     # ---------------------------------------------------------------- new sample
@@ -106,7 +119,7 @@ def serialize_geometry(model, *, new_sample=None) -> dict:
         top_features_z = {str(names[j]): float(z[j]) for j in top}
 
         geo["new_sample"] = {
-            "pca_coords": [float(c) for c in sample_scores.tolist()],
+            "pca_coords": [float(c) for c in sample_map.tolist()],  # 2-D map coords
             "predicted": {"label": pred_label, "proba": pred_proba},
             "top_features_z": top_features_z,
         }

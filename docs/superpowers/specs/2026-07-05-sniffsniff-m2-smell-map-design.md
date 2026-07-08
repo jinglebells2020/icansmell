@@ -85,9 +85,13 @@ def simulate_dataset(config, odors: list[str], reps: int, *, seed: int,
 ### `model.py`
 ```python
 class SmellModel:
-    def __init__(self, n_components: int = 2, classifier: str = "knn",
+    MAP_DIMS = 2   # the 2-D "map" is the first two PCs
+    def __init__(self, n_components: int = 5, classifier: str = "knn",
                  novelty_alpha: float = 0.975): ...
-        # classifier in {"knn","svm","rf","lda"}; novelty threshold = chi2.ppf(alpha, df=n_components)
+        # classifier in {"knn","svm","rf","lda"}; novelty threshold = sqrt(chi2.ppf(alpha, df=k)).
+        # DECOUPLED: classify + novelty use k≈5 PCs (2-D throws away most variance and
+        # tanks accuracy); the 2-D map is just the first two PCs. k is clamped at fit to
+        # min(k, n_features, n_samples-1) and exposed as n_components_.
     def fit(self, X, y) -> "SmellModel"
         # StandardScaler().fit → PCA(n_components).fit → classifier.fit on PCA scores.
         # store classes_, explained_variance_ratio_, loadings_ (n_components,48),
@@ -121,7 +125,8 @@ def serialize_geometry(model, *, dataset=None, new_sample=None) -> dict
 M3 JSON schema:
 ```json
 {
-  "pca": {"n_components": 2, "explained_variance_ratio": [0.71, 0.18]},
+  "pca": {"map_components": 2, "working_components": 5,
+          "map_explained_variance_ratio": [0.21, 0.18], "total_explained_variance": 0.64},
   "axis_interpretation": {"PC1": "MQ3__peak(+), MQ2__peak(+)", "PC2": "MQ135__peak(+)"},
   "known_clusters": {
     "coffee": {"centroid": [1.2, -0.5], "radius": 0.6, "n": 8, "distance": 0.63},
