@@ -107,7 +107,9 @@ def _make_reader(args, cfg: Config, *, seed: int | None = None):
         return SimulatedReader(frames)
     from .serialio import SerialReader
 
-    return SerialReader(args.port, n_channels=cfg.n_channels)
+    # reconnect=False so a bounded capture ends on a silent/absent device instead
+    # of looping forever waiting for a frame that never comes.
+    return SerialReader(args.port, n_channels=cfg.n_channels, reconnect=False)
 
 
 def _cmd_stream(args) -> int:
@@ -396,7 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--config", default=None, help="path to a config TOML")
     p_tui.add_argument("--out", default="data", help="output directory")
     p_tui.add_argument("--model", default="model.joblib", help="model path")
-    p_tui.add_argument("--reps", type=int, default=8, help="sniffs per record")
+    p_tui.add_argument("--reps", type=int, default=1, help="sniffs per record press")
     p_tui.add_argument("--label", default="coffee", help="default record label")
     p_tui.add_argument("--seed", type=int, default=0)
     p_tui.set_defaults(func=_cmd_tui)

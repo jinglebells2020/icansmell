@@ -53,12 +53,13 @@ class SniffApp(App):
     ]
 
     def __init__(
-        self, controller: SniffController, *, reps: int = 8, label: str | None = None
+        self, controller: SniffController, *, reps: int = 1, label: str | None = None
     ) -> None:
         super().__init__()
         self.controller = controller
         self.reps = reps
         self.label = label or _ODORS[0]
+        self._busy = False  # a capture/fit/map is running — refuse a second
 
     # ------------------------------------------------------------- layout
     def compose(self) -> ComposeResult:
@@ -73,8 +74,22 @@ class SniffApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        import numpy as np
+
+        # Populate the sensor panel immediately so it isn't an empty, collapsed box
+        # before the first capture (a zeroed bar per configured sensor).
+        names = self.controller.config.sensor_names()
+        self.query_one("#sensors", SensorBars).update_values(
+            names, np.zeros(len(names)), phase="idle"
+        )
         self._refresh_workflow()
-        self._log(f"ready — label '{self.label}', {'sim' if self.controller.use_sim else 'real'}")
+        mode = "sim" if self.controller.use_sim else "real"
+        self._log(f"ready — label '{self.label}', {mode}")
+        # In real mode with no device present, say so loudly instead of failing later.
+        if not self.controller.use_sim and not self.controller.connected:
+            self._log(
+                f"⚠ no device at {self.controller.port} — reconnect it, or press s for the simulator"
+            )
 
     # -------------------------------------------------------- ui helpers
     def _log(self, msg: str) -> None:
@@ -88,6 +103,16 @@ class SniffApp(App):
 
     def _set_nose(self, state: str) -> None:
         self.query_one("#nose", NoseWidget).set_state(state)
+
+    def _clear_busy(self) -> None:
+        self._busy = False
+
+    def _reject_if_busy(self) -> bool:
+        """Log + return True when a long action is already running (guard)."""
+        if self._busy:
+            self._log("busy — a capture/fit is already running; please wait")
+            return True
+        return False
 
     # ------------------------------------------------------- no-op-ish
     def action_cycle_label(self) -> None:
@@ -111,6 +136,9 @@ class SniffApp(App):
 
     # ---------------------------------------------------------- record
     def action_record(self) -> None:
+        if self._reject_if_busy():
+            return
+        self._busy = True
         self._log(f"recording {self.reps} × '{self.label}' …")
         self._record_worker(self.label, self.reps)
 
@@ -157,9 +185,13 @@ class SniffApp(App):
         finally:
             self.call_from_thread(self._set_nose, "idle")
             self.call_from_thread(self._refresh_workflow)
+            self.call_from_thread(self._clear_busy)
 
     # ------------------------------------------------------------- fit
     def action_fit(self) -> None:
+        if self._reject_if_busy():
+            return
+        self._busy = True
         self._log("fitting model …")
         self._fit_worker()
 
@@ -175,12 +207,16 @@ class SniffApp(App):
             )
         finally:
             self.call_from_thread(self._refresh_workflow)
+            self.call_from_thread(self._clear_busy)
 
     # -------------------------------------------------------- identify
     def action_identify(self) -> None:
+        if self._reject_if_busy():
+            return
         if not self.controller.has_model():
             self._log("identify: no model yet — press f to fit first")
             return
+        self._busy = True
         self._log("identifying one sniff …")
         self._identify_worker()
 
@@ -215,15 +251,19 @@ class SniffApp(App):
             )
         finally:
             self.call_from_thread(self._set_nose, "idle")
+            self.call_from_thread(self._clear_busy)
 
     # ------------------------------------------------------------- map
     def action_map(self) -> None:
+        if self._reject_if_busy():
+            return
         if not self.controller.has_model():
             self._log("map: no model yet — press f to fit first")
             return
         if not self.controller.dataset_counts():
             self._log("map: no recorded data — press r to record first")
             return
+        self._busy = True
         self._log("rendering smell map …")
         self._map_worker()
 
@@ -242,10 +282,12 @@ class SniffApp(App):
             self.call_from_thread(self._log, f"map failed: {exc}")
         else:
             self.call_from_thread(self._log, f"saved map: {saved}")
+        finally:
+            self.call_from_thread(self._clear_busy)
 
 
 def run_tui(
-    controller: SniffController, *, reps: int = 8, label: str | None = None
+    controller: SniffController, *, reps: int = 1, label: str | None = None
 ) -> None:
     """Launch the Textual app over ``controller`` (blocks until the user quits)."""
     SniffApp(controller, reps=reps, label=label).run()

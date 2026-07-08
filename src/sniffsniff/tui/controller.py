@@ -11,6 +11,7 @@ the reused pipeline modules, so it can be unit-tested headlessly.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -46,15 +47,19 @@ class SniffController:
         self.port = port
         self.seed = seed
         self.model_path = model_path
-        self._connected = False
 
     # ---------------------------------------------------------------- status
     @property
     def connected(self) -> bool:
-        """``True`` when simulating, else ``True`` once a live reader has opened."""
+        """``True`` when simulating, else whether the serial device node exists.
+
+        Checks ``os.path.exists(port)`` — cheap and, crucially, non-disruptive:
+        it does *not* open the port (opening an Arduino Uno toggles DTR and resets
+        the board), so status can be polled freely.
+        """
         if self.use_sim:
             return True
-        return self._connected
+        return os.path.exists(self.port)
 
     def has_model(self) -> bool:
         """Whether a trained model exists at :attr:`model_path`."""
@@ -76,9 +81,11 @@ class SniffController:
             sim = Simulator(self.config, seed=sim_seed)
             frames = sim.sniff_frames(odor or "coffee")
             return SimulatedReader(frames)
-        reader = SerialReader(self.port, n_channels=self.config.n_channels)
-        self._connected = True
-        return reader
+        # reconnect=False: a bounded capture must NOT loop forever on a present-but-
+        # silent device (readline timing out to b"") — it ends and we report no data.
+        return SerialReader(
+            self.port, n_channels=self.config.n_channels, reconnect=False
+        )
 
     # ---------------------------------------------------------------- record
     def record_one(
@@ -89,6 +96,11 @@ class SniffController:
         frames = capture_session(
             reader, self.config, on_phase=on_phase, on_frame=on_frame
         )
+        if not frames:
+            raise RuntimeError(
+                f"no data from {self.port} — is the firmware flashed and streaming? "
+                "(or press s for the simulator)"
+            )
         return SniffRecorder(self.config, self.out_dir).record(frames, label)
 
     def record_many(
@@ -167,6 +179,10 @@ class SniffController:
         frames = capture_session(
             reader, self.config, on_phase=on_phase, on_frame=on_frame
         )
+        if not frames:
+            raise RuntimeError(
+                f"no data from {self.port} — is the firmware flashed and streaming?"
+            )
         feats = SniffRecorder(self.config, self.out_dir).process(frames, "?").features
         row = feats.reshape(1, -1)
 

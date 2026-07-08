@@ -83,3 +83,31 @@ def test_phase_of_boundaries():
     assert phase_of(sl["exposure"][0], sl) == "exposure"
     assert phase_of(sl["purge"][0], sl) == "purge"
     assert phase_of(n - 1, sl) == "purge"
+
+
+def test_capture_silent_device_does_not_hang():
+    """A present-but-SILENT device (readline always b"") must end a bounded capture
+    quickly when the reader is built with reconnect=False — never loop forever."""
+    import threading
+    from sniffsniff.serialio import SerialReader
+
+    cfg = _short()
+
+    class _Silent:
+        def readline(self):
+            return b""  # device node exists but streams nothing
+
+        def close(self):
+            pass
+
+    reader = SerialReader("x", n_channels=6, reconnect=False, opener=lambda: _Silent())
+    done = {}
+
+    def run():
+        done["frames"] = capture_session(reader, cfg)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=4)
+    assert not t.is_alive(), "capture hung on a silent device"
+    assert done["frames"] == []
