@@ -19,8 +19,14 @@ from sniffsniff.config import default_config
 from sniffsniff.monitor import ContinuousSim
 from sniffsniff.tui.app import SniffApp
 from sniffsniff.tui.controller import CLASSIFIERS, SniffController
-from sniffsniff.tui.nose import NoseWidget
-from sniffsniff.tui.widgets import CoachPanel, LabelList, LogPanel, SensorBars, WorkflowPanel
+from sniffsniff.tui.widgets import (
+    CapturePanel,
+    CoachPanel,
+    HeaderBar,
+    LabelList,
+    LogPanel,
+    SensorBars,
+)
 
 
 def _fast_config():
@@ -100,7 +106,7 @@ def test_app_mounts_and_has_widgets(tmp_path):
     async def scenario():
         async with app.run_test() as pilot:
             await pilot.pause()
-            for w in (NoseWidget, SensorBars, LabelList, CoachPanel, LogPanel):
+            for w in (HeaderBar, SensorBars, CapturePanel, LabelList, CoachPanel, LogPanel):
                 assert app.query_one(w) is not None
             assert app.query_one("#status") is not None
             assert app._engine is not None  # monitor engine wired on mount
@@ -155,6 +161,89 @@ def test_recovery_status_after_a_sniff(tmp_path):
                 app._on_engine_event(app._engine.step(sim.read()), names)
             status = str(app.query_one("#status").render()).lower()
             assert "recover" in status  # "recovering …" or "recovered"
+
+    asyncio.run(scenario())
+
+
+def _idle_event(names, recovery):
+    """A monitor-phase engine event carrying only a recovery status (for the UI)."""
+    import numpy as np
+
+    return {
+        "rs": np.zeros(len(names)),
+        "phase": "monitor",
+        "phase_changed": False,
+        "capture": None,
+        "saved": None,
+        "settle": None,
+        "plateau": None,
+        "recovery": recovery,
+    }
+
+
+def test_recovering_shows_recover_state(tmp_path):
+    """While the sensors are still returning to rest, both the header pill and the
+    CAPTURE card should read as 'recovering'."""
+    _, app = _app(tmp_path, label="coffee")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            names = app.controller.config.sensor_names()
+            ev = _idle_event(names, {
+                "recovered": False, "just_recovered": False,
+                "max_dev": 0.03, "worst_channel": 0, "held_s": 1.0, "target_s": 5.0,
+            })
+            app._on_engine_event(ev, names)
+            header = str(app.query_one("#headerbar").render()).lower()
+            status = str(app.query_one("#status").render()).lower()
+            assert "recovering" in header
+            assert "recovering" in status
+
+    asyncio.run(scenario())
+
+
+def test_recovered_returns_to_idle_not_stuck(tmp_path):
+    """Regression: once recovery has latched, the engine re-emits a recovered status
+    on every idle frame. The header/CAPTURE must return to monitoring/idle — not stay
+    stuck showing 'recovering' forever (which also contradicts its own detail line)."""
+    _, app = _app(tmp_path, label="coffee")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            names = app.controller.config.sensor_names()
+            ev = _idle_event(names, {
+                "recovered": True, "just_recovered": False,
+                "max_dev": 0.0, "worst_channel": -1, "held_s": 5.0, "target_s": 5.0,
+            })
+            # feed several such frames — the state must not latch to "recovering"
+            for _ in range(5):
+                app._on_engine_event(ev, names)
+            header = str(app.query_one("#headerbar").render()).lower()
+            status = str(app.query_one("#status").render()).lower()
+            assert "monitoring" in header
+            assert "recovering" not in header
+            assert "recovering" not in status  # idle card, not the recover stepper
+
+    asyncio.run(scenario())
+
+
+def test_just_recovered_logs_once(tmp_path):
+    """The single frame recovery is first reached logs a one-time confirmation."""
+    _, app = _app(tmp_path, label="coffee")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            names = app.controller.config.sensor_names()
+            messages = _spy_log(app)
+            ev = _idle_event(names, {
+                "recovered": True, "just_recovered": True,
+                "max_dev": 0.0, "worst_channel": -1, "held_s": 5.0, "target_s": 5.0,
+            })
+            app._on_engine_event(ev, names)
+            assert any("recovered" in m.lower() for m in messages)
 
     asyncio.run(scenario())
 
@@ -231,6 +320,24 @@ def test_c_cycles_classifier(tmp_path):
             await pilot.press("c")
             await pilot.pause()
             assert ctrl.classifier == CLASSIFIERS[1]
+
+    asyncio.run(scenario())
+
+
+def test_toggle_sim_flips_source_and_header(tmp_path):
+    """`s` rebuilds the controller onto the other source and the header pill follows
+    (sim -> live). The injected silent source keeps it from touching a real port."""
+    _, app = _app(tmp_path, label="coffee")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.controller.use_sim is True
+            assert "sim" in str(app.query_one("#headerbar").render()).lower()
+            await pilot.press("s")
+            await pilot.pause()
+            assert app.controller.use_sim is False
+            assert "live" in str(app.query_one("#headerbar").render()).lower()
 
     asyncio.run(scenario())
 

@@ -18,11 +18,17 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, Label, Static
+from textual.widgets import Footer, Input, Label
 
-from .controller import SniffController
-from .nose import NoseWidget
-from .widgets import CoachPanel, LabelList, LogPanel, SensorBars, WorkflowPanel
+from .controller import GOOD_REPS, SniffController
+from .widgets import (
+    CapturePanel,
+    CoachPanel,
+    HeaderBar,
+    LabelList,
+    LogPanel,
+    SensorBars,
+)
 
 __all__ = ["SniffApp", "run_tui"]
 
@@ -54,16 +60,24 @@ class SniffApp(App):
     """Interactive e-nose console over a :class:`SniffController`."""
 
     CSS = """
-    #body { height: 1fr; }
-    #left { width: 1fr; }
-    #right { width: 2fr; }
-    NoseWidget { height: auto; border: round $accent; padding: 1; }
-    LabelList { height: 1fr; border: round $primary; padding: 1; }
-    CoachPanel { height: auto; border: round $warning; padding: 1; }
-    WorkflowPanel { height: auto; border: round $primary; padding: 1; }
-    SensorBars { height: auto; border: round $secondary; padding: 1; }
-    #status { height: auto; border: round $success; padding: 0 1; }
-    LogPanel { height: 1fr; border: round $panel; }
+    HeaderBar { height: 1; padding: 0 2; background: $panel; color: $text; }
+
+    #body { height: 1fr; padding: 1 1 0 1; }
+    #left { width: 3fr; }
+    #right { width: 2fr; margin-left: 1; }
+
+    SensorBars, CapturePanel, CoachPanel, LabelList, LogPanel {
+        border-title-align: left;
+        border-title-color: $accent;
+        border: round $primary-darken-1;
+        padding: 0 1;
+    }
+    /* Reserve the bright accent border for the live-capture card. */
+    CapturePanel { height: auto; border: round $accent; margin-bottom: 1; }
+    SensorBars { height: auto; margin-bottom: 1; }
+    CoachPanel { height: auto; margin-bottom: 1; }
+    LabelList { height: 1fr; }
+    LogPanel { height: 1fr; }
     """
 
     BINDINGS = [
@@ -118,26 +132,41 @@ class SniffApp(App):
 
     # ------------------------------------------------------------- layout
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield HeaderBar(id="headerbar")
         with Horizontal(id="body"):
             with Vertical(id="left"):
-                yield NoseWidget(id="nose")
-                yield LabelList(id="labels")
-                yield CoachPanel(id="coach")
-                yield WorkflowPanel(id="workflow")
-            with Vertical(id="right"):
                 yield SensorBars(id="sensors")
-                yield Static("", id="status")
+                yield CapturePanel(id="status")
                 yield LogPanel(id="log")
+            with Vertical(id="right"):
+                yield CoachPanel(id="coach")
+                yield LabelList(id="labels")
         yield Footer()
 
     def on_mount(self) -> None:
         import numpy as np
 
+        self.title = "sniffsniff"
+        try:
+            self.theme = "nord"  # muted, modern palette for the dashboard look
+        except Exception:  # pragma: no cover - older textual without theme support
+            pass
+        # Card titles rendered in each panel's border.
+        for wid, title in (
+            ("#sensors", "SENSORS"),
+            ("#status", "CAPTURE"),
+            ("#coach", "COACH"),
+            ("#labels", "LABELS"),
+            ("#log", "LOG"),
+        ):
+            self.query_one(wid).border_title = title
+
         names = self.controller.config.sensor_names()
         self.query_one("#sensors", SensorBars).update_values(
-            names, np.zeros(len(names)), phase="idle"
+            names, np.zeros(len(names))
         )
+        self._update_header("monitoring")
+        self.query_one("#status", CapturePanel).update_capture("monitor", None, "")
         self._refresh_all()
         mode = "sim" if self.controller.use_sim else "real"
         self._log(f"ready — label '{self.label}', {mode}")
@@ -154,19 +183,19 @@ class SniffApp(App):
     def _log(self, msg: str) -> None:
         self.query_one("#log", LogPanel).write_line(msg)
 
-    def _status(self, msg: str) -> None:
-        self.query_one("#status", Static).update(msg)
-
-    def _refresh_workflow(self) -> None:
+    def _update_header(self, phase_label: str) -> None:
         ctrl = self.controller
-        self.query_one("#workflow", WorkflowPanel).update_state(
-            ctrl.connected, ctrl.dataset_counts(), ctrl.has_model()
+        self.query_one("#headerbar", HeaderBar).update_header(
+            "sim" if ctrl.use_sim else "real",
+            ctrl.connected,
+            ctrl.has_model(),
+            phase_label,
         )
 
     def _refresh_labels(self) -> None:
         ctrl = self.controller
         self.query_one("#labels", LabelList).update_labels(
-            ctrl.known_labels(), ctrl.dataset_counts(), self.label
+            ctrl.known_labels(), ctrl.dataset_counts(), self.label, GOOD_REPS
         )
 
     def _refresh_coach(self) -> None:
@@ -179,10 +208,7 @@ class SniffApp(App):
     def _refresh_all(self) -> None:
         self._refresh_labels()
         self._refresh_coach()
-        self._refresh_workflow()
-
-    def _set_nose(self, state: str) -> None:
-        self.query_one("#nose", NoseWidget).set_state(state)
+        self._update_header("monitoring")
 
     def _clear_busy(self) -> None:
         self._busy = False
@@ -258,25 +284,35 @@ class SniffApp(App):
                 pass
 
     def _on_engine_event(self, ev: dict, names) -> None:
-        """Render one engine event (runs on the UI thread via call_from_thread)."""
+        """Render one engine event (runs on the UI thread via call_from_thread).
+
+        Folds the settle / capture / exposure / recovery event fields into one
+        ``(step_phase, frac, detail)`` for the CAPTURE stepper, and a top-level
+        phase label for the header pill.
+        """
         phase = ev["phase"]
-        self.query_one("#sensors", SensorBars).update_values(names, ev["rs"], phase)
-        self._set_nose("sniffing" if phase == "exposure" else "idle")
+        self.query_one("#sensors", SensorBars).update_values(names, ev["rs"])
+
+        step_phase = phase       # what the stepper highlights
+        frac = None              # progress-bar fraction (None -> no bar)
+        detail = ""              # status detail line
 
         if ev["settle"] is not None:
             st = ev["settle"]
+            step_phase = "settle"
             if st["timed_out"]:
-                self._status(f"⏳ settle timed out ({st['waited_s']:.0f}s) — proceeding")
+                detail = f"⏳ settle timed out ({st['waited_s']:.0f}s) — proceeding"
             else:
                 dev = f"{st['max_dev'] * 100:.1f}%" if st["max_dev"] is not None else "…"
-                self._status(
+                detail = (
                     f"⏳ settling — waiting for a stable baseline ({dev}, {st['waited_s']:.1f}s)"
                 )
 
         if ev["capture"] is not None:
             k, n = ev["capture"]
-            pct = k * 100 // n
+            frac = (k / n) if n else None
             pl = ev["plateau"]
+            active = str(self._active_label or "").replace("[", r"\[")  # markup-safe
             if phase == "exposure" and pl is not None:
                 # show the response developing so the operator can trust the timing:
                 # magnitude, and whether it's still rising or holding toward a plateau.
@@ -285,29 +321,46 @@ class SniffApp(App):
                     "still rising" if growing
                     else f"holding {pl['held_s']:.0f}/{self._engine.plateau_hold_s:.0f}s"
                 )
-                self._status(
-                    f"⏺ '{self._active_label}' exposure {pl['elapsed_s']:.0f}s — "
+                detail = (
+                    f"⏺ '{active}' exposure {pl['elapsed_s']:.0f}s — "
                     f"response {pl['mag'] * 100:.1f}% ({tail})"
                 )
             else:
-                self._status(
-                    f"⏺ capturing '{self._active_label}' — {phase} {k}/{n} ({pct}%)"
+                pct = k * 100 // n if n else 0
+                detail = (
+                    f"⏺ capturing '{active}' — {phase} {k}/{n} ({pct}%)"
                 )
 
         if ev["saved"] is not None:
             self._on_capture_complete(ev["saved"])
 
+        # The engine latches a recovered sniff and re-emits its recovery status on
+        # EVERY idle frame thereafter (it only clears when the next capture arms). So
+        # only treat it as the "recover" phase while still returning to rest — once
+        # recovered, the device is idle/monitoring, not perpetually "recovering".
         rec = ev["recovery"]
-        if rec is not None:
-            if rec["recovered"]:
-                if rec["just_recovered"]:
-                    self._status("✓ sensors recovered — ready for the next sniff")
-            else:
-                wc = names[rec["worst_channel"]] if rec["worst_channel"] >= 0 else "?"
-                self._status(
-                    f"… recovering — {rec['max_dev'] * 100:.1f}% off ({wc}), "
-                    f"held {rec['held_s']:.1f}/{rec['target_s']:.0f}s"
-                )
+        if rec is not None and not rec["recovered"]:
+            step_phase = "recover"
+            frac = (rec["held_s"] / rec["target_s"]) if rec["target_s"] else None
+            wc = names[rec["worst_channel"]] if rec["worst_channel"] >= 0 else "?"
+            detail = (
+                f"… recovering — {rec['max_dev'] * 100:.1f}% off ({wc}), "
+                f"held {rec['held_s']:.1f}/{rec['target_s']:.0f}s"
+            )
+        elif rec is not None and rec["just_recovered"]:
+            # one-time confirmation the moment the sensors settle back
+            self._log("✓ sensors recovered — ready for the next sniff")
+
+        top = {
+            "settle": "settling",
+            "baseline": "recording",
+            "exposure": "recording",
+            "purge": "recording",
+            "recover": "recovering",
+            "monitor": "monitoring",
+        }.get(step_phase, "monitoring")
+        self._update_header(top)
+        self.query_one("#status", CapturePanel).update_capture(step_phase, frac, detail)
 
 
     def _on_capture_complete(self, saved) -> None:

@@ -72,11 +72,32 @@ e.g. alcohol peaks on MQ-3, vinegar and spoiled-milk on MQ-135.
 
 | Command | What it does |
 |---------|--------------|
+| `sniffsniff tui [--sim] [--port P] [--label L] [--reps N]` | interactive dashboard: live sensors + guided record→fit→identify→think |
 | `sniffsniff simulate [--odor O]` | print per-odor plateau fractional summary |
 | `sniffsniff record --label L [--sim] [--out DIR] [--port P]` | capture one sniff → `.npz` + manifest row |
 | `sniffsniff stream [--sim] [--port P]` | print a few live calibrated frames |
 
 `--sim` uses the simulator; without it, a real `SerialReader` opens `--port`.
+
+### Interactive console (TUI)
+
+`sniffsniff tui --sim` opens a live dashboard (needs the `tui` extra —
+`pip install sniffsniff[tui]`). It runs **one** continuous monitor loop: the sensor
+panel streams the whole time, and a record/identify is just a *window* over that
+same stream — no Uno reset between sniffs.
+
+- **SENSORS** — per-channel sparkline (recent history) + magnitude gauge + a
+  rising/flat/falling trend arrow, with a `⚠` on channels whose clean-air baseline
+  is too noisy.
+- **CAPTURE** — a phase stepper (settle → baseline → exposure → purge) with a live
+  progress bar and the response magnitude as it develops, then a return-to-baseline
+  recovery readout.
+- **COACH** / **LABELS** — the next suggested step, and a dot-meter of how many
+  sniffs each label has toward the training target.
+
+Keys: `r` record · `n`/`p` label · `a` add label · `+`/`-` reps · `c` classifier ·
+`x` undo last · `X` clear · `f` fit · `i` identify · `t` think (LLM) · `m` map ·
+`s` sim/real · `q` quit.
 
 ## Dataset format
 
