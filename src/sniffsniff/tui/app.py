@@ -1,29 +1,26 @@
 """The Textual app that wires the sniffsniff pipeline into an interactive TUI.
 
-:class:`SniffApp` owns *no* pipeline logic — it delegates everything to a
-:class:`~sniffsniff.tui.controller.SniffController` and merely reflects progress
-in widgets. All the slow work (capturing a bounded session, fitting, identifying,
-rendering the map) runs in ``@work(thread=True)`` worker threads so the event
-loop stays responsive; those workers touch widgets *only* through
-:meth:`textual.app.App.call_from_thread`.
+:class:`SniffApp` runs ONE persistent frame loop (a :class:`~sniffsniff.monitor.
+MonitorEngine` in a worker thread): every frame updates the live sensor bars, a
+record/identify is just a *window* over that same stream (no reopen, no Uno
+reset), and after each sniff the bars keep flowing while a status line reports
+return-to-baseline. Guided-training v2 (label list, coach, undo/clear) and the M3
+`think` reasoner sit on top. All slow work runs in ``@work(thread=True)`` workers;
+widgets are touched only via :meth:`textual.app.App.call_from_thread`.
 
-v2 turns it into a *guided training console*: a live per-label list, a coach line
-that always says the next step, and the ability to fix mistakes (delete the last
-sniff, clear + restart).
-
-``textual`` is an optional extra, so this module is imported lazily from the CLI
-(``_cmd_tui``). Importing it without ``textual`` installed raises ``ImportError``,
-which the CLI turns into a friendly install hint.
+``textual`` is an optional extra, imported lazily from the CLI.
 """
 from __future__ import annotations
+
+import time
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, Label
+from textual.widgets import Footer, Header, Input, Label, Static
 
-from .controller import CLASSIFIERS, SniffController
+from .controller import SniffController
 from .nose import NoseWidget
 from .widgets import CoachPanel, LabelList, LogPanel, SensorBars, WorkflowPanel
 
@@ -65,6 +62,7 @@ class SniffApp(App):
     CoachPanel { height: auto; border: round $warning; padding: 1; }
     WorkflowPanel { height: auto; border: round $primary; padding: 1; }
     SensorBars { height: auto; border: round $secondary; padding: 1; }
+    #status { height: auto; border: round $success; padding: 0 1; }
     LogPanel { height: 1fr; border: round $panel; }
     """
 
@@ -87,16 +85,32 @@ class SniffApp(App):
     ]
 
     def __init__(
-        self, controller: SniffController, *, reps: int = 1, label: str | None = None
+        self,
+        controller: SniffController,
+        *,
+        reps: int = 1,
+        label: str | None = None,
+        source_factory=None,
+        paced: bool | None = None,
     ) -> None:
         super().__init__()
         self.controller = controller
         self.reps = reps
         self.label = label or controller.known_labels()[0]
-        self._busy = False  # a capture/fit/map is running — refuse a second
-        self._clear_armed = False  # first X arms, second X within focus confirms
-        self._last_geometry = None  # geometry of the last identified sniff (for `t`)
-        self._last_verdict = None  # the last identify verdict dict (for `t`)
+        self._clear_armed = False       # first X arms, second X confirms
+        self._busy = False              # a fit/map/delete/clear worker is running
+        self._last_geometry = None      # geometry of the last identified sniff (for `t`)
+        self._last_verdict = None
+        # monitor-engine state
+        self._engine = None
+        self._source = None
+        self._monitor_stop = False
+        self._identify_pending = False
+        self._active_label = None
+        self._model = None              # cached loaded SmellModel (invalidated on fit)
+        # test hooks: inject a bounded frame source + disable real-time pacing
+        self._source_factory = source_factory
+        self._paced = paced
 
     # ------------------------------------------------------------- layout
     def compose(self) -> ComposeResult:
@@ -109,14 +123,13 @@ class SniffApp(App):
                 yield WorkflowPanel(id="workflow")
             with Vertical(id="right"):
                 yield SensorBars(id="sensors")
+                yield Static("", id="status")
                 yield LogPanel(id="log")
         yield Footer()
 
     def on_mount(self) -> None:
         import numpy as np
 
-        # Populate the sensor panel immediately so it isn't an empty, collapsed box
-        # before the first capture (a zeroed bar per configured sensor).
         names = self.controller.config.sensor_names()
         self.query_one("#sensors", SensorBars).update_values(
             names, np.zeros(len(names)), phase="idle"
@@ -124,15 +137,21 @@ class SniffApp(App):
         self._refresh_all()
         mode = "sim" if self.controller.use_sim else "real"
         self._log(f"ready — label '{self.label}', {mode}")
-        # In real mode with no device present, say so loudly instead of failing later.
         if not self.controller.use_sim and not self.controller.connected:
             self._log(
                 f"⚠ no device at {self.controller.port} — reconnect it, or press s for the simulator"
             )
+        self._start_monitor()
+
+    def on_unmount(self) -> None:
+        self._monitor_stop = True
 
     # -------------------------------------------------------- ui helpers
     def _log(self, msg: str) -> None:
         self.query_one("#log", LogPanel).write_line(msg)
+
+    def _status(self, msg: str) -> None:
+        self.query_one("#status", Static).update(msg)
 
     def _refresh_workflow(self) -> None:
         ctrl = self.controller
@@ -149,16 +168,11 @@ class SniffApp(App):
     def _refresh_coach(self) -> None:
         ctrl = self.controller
         self.query_one("#coach", CoachPanel).update_coach(
-            ctrl.next_step(),
-            ctrl.connected,
-            self.label,
-            self.reps,
-            ctrl.classifier,
-            ctrl.has_model(),
+            ctrl.next_step(), ctrl.connected, self.label, self.reps,
+            ctrl.classifier, ctrl.has_model(),
         )
 
     def _refresh_all(self) -> None:
-        """Refresh label list + coach + workflow (the three state panels)."""
         self._refresh_labels()
         self._refresh_coach()
         self._refresh_workflow()
@@ -170,15 +184,131 @@ class SniffApp(App):
         self._busy = False
 
     def _reject_if_busy(self) -> bool:
-        """Log + return True when a long action is already running (guard)."""
         if self._busy:
-            self._log("busy — a capture/fit is already running; please wait")
+            self._log("busy — a fit/map is running; please wait")
             return True
         return False
 
     def _disarm_clear(self) -> None:
-        """Any action other than a second X cancels a pending clear confirmation."""
         self._clear_armed = False
+
+    # -------------------------------------------------- monitor engine
+    def _build_source(self):
+        """Build the persistent frame source for the current mode (or a test hook)."""
+        if self._source_factory is not None:
+            return self._source_factory(self.controller)
+        ctrl = self.controller
+        cfg = ctrl.config
+        if ctrl.use_sim:
+            from ..monitor import ContinuousSim
+
+            return ContinuousSim(cfg, seed=ctrl.seed)
+        from ..serialio import SerialReader
+
+        return SerialReader(
+            ctrl.port, n_channels=cfg.n_channels, reconnect=False, startup_delay_s=2.5
+        )
+
+    def _start_monitor(self) -> None:
+        from ..monitor import MonitorEngine
+        from ..record import SniffRecorder
+
+        self._monitor_stop = False
+        self._engine = MonitorEngine(
+            self.controller.config, SniffRecorder(self.controller.config, self.controller.out_dir)
+        )
+        self._source = self._build_source()
+        self._monitor_worker()
+
+    @work(thread=True, exclusive=True, group="monitor")
+    def _monitor_worker(self) -> None:
+        engine = self._engine
+        source = self._source
+        names = self.controller.config.sensor_names()
+        hz = max(1, self.controller.config.scan_hz)
+        paced = self.controller.use_sim if self._paced is None else self._paced
+        try:
+            for frame in source.frames():
+                if self._monitor_stop:
+                    break
+                ev = engine.step(frame)
+                self.call_from_thread(self._on_engine_event, ev, names)
+                if paced:
+                    time.sleep(1.0 / hz)
+        except Exception as exc:  # pragma: no cover - device/stream error
+            self.call_from_thread(self._log, f"monitor stopped: {exc}")
+        finally:
+            try:
+                source.close()
+            except Exception:  # pragma: no cover
+                pass
+
+    def _on_engine_event(self, ev: dict, names) -> None:
+        """Render one engine event (runs on the UI thread via call_from_thread)."""
+        phase = ev["phase"]
+        self.query_one("#sensors", SensorBars).update_values(names, ev["rs"], phase)
+        self._set_nose("sniffing" if phase == "exposure" else "idle")
+
+        if ev["capture"] is not None:
+            k, n = ev["capture"]
+            pct = k * 100 // n
+            self._status(f"⏺ capturing '{self._active_label}' — {phase} {k}/{n} ({pct}%)")
+
+        if ev["saved"] is not None:
+            self._on_capture_complete(ev["saved"])
+
+        rec = ev["recovery"]
+        if rec is not None:
+            if rec["recovered"]:
+                if rec["just_recovered"]:
+                    self._status("✓ sensors recovered — ready for the next sniff")
+            else:
+                wc = names[rec["worst_channel"]] if rec["worst_channel"] >= 0 else "?"
+                self._status(
+                    f"… recovering — {rec['max_dev'] * 100:.1f}% off ({wc}), "
+                    f"held {rec['held_s']:.1f}/{rec['target_s']:.0f}s"
+                )
+
+    def _on_capture_complete(self, saved) -> None:
+        result, path = saved
+        if self._identify_pending:
+            self._identify_pending = False
+            try:
+                verdict = self._classify(result.features)
+            except Exception as exc:
+                self._log(f"identify failed: {exc}")
+            else:
+                self._last_geometry = verdict["geometry"]
+                self._last_verdict = verdict
+                self._log(
+                    f"predicted {verdict['label']} (p={verdict['proba']:.3f}) "
+                    f"novelty {verdict['novelty']:.3f} is_novel {verdict['is_novel']}"
+                )
+        elif path is not None:
+            self._log(f"saved {path.name}")
+        self._active_label = None
+        self._refresh_all()
+
+    def _classify(self, features) -> dict:
+        import numpy as np
+
+        from ..geometry import serialize_geometry
+        from ..model import SmellModel
+
+        if self._model is None:
+            self._model = SmellModel.load(self.controller.model_path)
+        m = self._model
+        row = np.asarray(features).reshape(1, -1)
+        classes, proba = m.predict_proba(row)
+        pr = np.asarray(proba)[0]
+        k = int(pr.argmax())
+        return {
+            "label": str(classes[k]),
+            "proba": float(pr[k]),
+            "novelty": float(m.novelty(row)[0]),
+            "is_novel": bool(m.is_novel(row)[0]),
+            "geometry": serialize_geometry(m, new_sample=np.asarray(features)),
+        }
 
     # ------------------------------------------------------- label / reps
     def action_next_label(self) -> None:
@@ -231,75 +361,49 @@ class SniffApp(App):
         self._refresh_coach()
 
     def action_toggle_sim(self) -> None:
-        """Flip the sim/real flag by rebuilding the controller in place."""
+        """Flip sim/real: rebuild the controller and restart the monitor loop."""
         self._disarm_clear()
+        self._monitor_stop = True  # stop the current monitor before switching ports
         ctrl = self.controller
         new = SniffController(
-            ctrl.config,
-            out_dir=ctrl.out_dir,
-            use_sim=not ctrl.use_sim,
-            port=ctrl.port,
-            seed=ctrl.seed,
-            model_path=ctrl.model_path,
+            ctrl.config, out_dir=ctrl.out_dir, use_sim=not ctrl.use_sim,
+            port=ctrl.port, seed=ctrl.seed, model_path=ctrl.model_path,
         )
-        new.classifier = ctrl.classifier  # preserve the chosen classifier
+        new.classifier = ctrl.classifier
         self.controller = new
-        self._log(f"source → {'sim' if self.controller.use_sim else 'real'}")
+        self._model = None
+        self._log(f"source → {'sim' if new.use_sim else 'real'}")
         self._refresh_all()
+        self._start_monitor()
 
     # ---------------------------------------------------------- record
     def action_record(self) -> None:
         self._disarm_clear()
-        if self._reject_if_busy():
+        if self._engine is None:
             return
-        self._busy = True
-        self._log(f"recording {self.reps} × '{self.label}' …")
-        self._record_worker(self.label, self.reps)
+        if self._engine.capturing:
+            self._log("busy — a sniff is already being captured")
+            return
+        if self._engine.arm_capture(self.label, save=True):
+            self._active_label = self.label
+            self._log(f"recording '{self.label}' — follow the phase cues")
+            if self.controller.use_sim and hasattr(self._source, "begin_odor"):
+                self._source.begin_odor(self.label)
 
-    @work(thread=True)
-    def _record_worker(self, label: str, reps: int) -> None:
-        ctrl = self.controller
-        names = ctrl.config.sensor_names()
-
-        import numpy as np
-
-        def on_phase(phase: str, k: int, n: int) -> None:
-            self.call_from_thread(
-                self._set_nose, "sniffing" if phase == "exposure" else "idle"
-            )
-            self.call_from_thread(
-                self.query_one("#sensors", SensorBars).update_values,
-                names,
-                np.zeros(ctrl.config.n_channels),
-                phase,
-            )
-
-        def on_frame(k: int, n: int, phase: str, frame) -> None:
-            self.call_from_thread(
-                self.query_one("#sensors", SensorBars).update_values,
-                names,
-                ctrl.rs_of(frame[1]),
-                phase,
-            )
-
-        def on_saved(path, i: int) -> None:
-            self.call_from_thread(self._log, f"saved {path.name} ({i + 1}/{reps})")
-            self.call_from_thread(self._refresh_all)
-
-        try:
-            ctrl.record_many(
-                label,
-                reps,
-                on_phase=on_phase,
-                on_frame=on_frame,
-                on_saved=on_saved,
-            )
-        except Exception as exc:  # pragma: no cover - defensive UI path
-            self.call_from_thread(self._log, f"record failed: {exc}")
-        finally:
-            self.call_from_thread(self._set_nose, "idle")
-            self.call_from_thread(self._refresh_all)
-            self.call_from_thread(self._clear_busy)
+    # -------------------------------------------------------- identify
+    def action_identify(self) -> None:
+        self._disarm_clear()
+        if self._engine is None or self._engine.capturing:
+            return
+        if not self.controller.has_model():
+            self._log("identify: no model yet — press f to fit first")
+            return
+        if self._engine.arm_capture("?", save=False):
+            self._identify_pending = True
+            self._active_label = "?"
+            self._log("identifying one sniff …")
+            if self.controller.use_sim and hasattr(self._source, "begin_odor"):
+                self._source.begin_odor(self.label)
 
     # ----------------------------------------------------- delete / clear
     def action_delete_last(self) -> None:
@@ -317,13 +421,9 @@ class SniffApp(App):
             self.call_from_thread(self._log, f"delete failed: {exc}")
         else:
             if deleted is None:
-                self.call_from_thread(
-                    self._log, f"nothing to delete for '{label}'"
-                )
+                self.call_from_thread(self._log, f"nothing to delete for '{label}'")
             else:
-                self.call_from_thread(
-                    self._log, f"deleted {deleted.name} (undo capture)"
-                )
+                self.call_from_thread(self._log, f"deleted {deleted.name} (undo capture)")
         finally:
             self.call_from_thread(self._refresh_all)
             self.call_from_thread(self._clear_busy)
@@ -371,60 +471,12 @@ class SniffApp(App):
         except Exception as exc:
             self.call_from_thread(self._log, f"fit failed: {exc}")
         else:
+            self._model = None  # invalidate the cached model
             self.call_from_thread(
                 self._log, f"trained ✓ cross-val accuracy {mean:.3f} ± {std:.3f}"
             )
         finally:
             self.call_from_thread(self._refresh_all)
-            self.call_from_thread(self._clear_busy)
-
-    # -------------------------------------------------------- identify
-    def action_identify(self) -> None:
-        self._disarm_clear()
-        if self._reject_if_busy():
-            return
-        if not self.controller.has_model():
-            self._log("identify: no model yet — press f to fit first")
-            return
-        self._busy = True
-        self._log("identifying one sniff …")
-        self._identify_worker()
-
-    @work(thread=True)
-    def _identify_worker(self) -> None:
-        ctrl = self.controller
-        names = ctrl.config.sensor_names()
-
-        def on_phase(phase: str, k: int, n: int) -> None:
-            self.call_from_thread(
-                self._set_nose, "sniffing" if phase == "exposure" else "idle"
-            )
-
-        def on_frame(k: int, n: int, phase: str, frame) -> None:
-            self.call_from_thread(
-                self.query_one("#sensors", SensorBars).update_values,
-                names,
-                ctrl.rs_of(frame[1]),
-                phase,
-            )
-
-        try:
-            result = ctrl.identify(on_phase=on_phase, on_frame=on_frame)
-        except Exception as exc:
-            self.call_from_thread(self._log, f"identify failed: {exc}")
-        else:
-            # Stash for the `t` (think) action, which reasons over this geometry.
-            self._last_geometry = result["geometry"]
-            self._last_verdict = result
-            self.call_from_thread(
-                self._log,
-                f"predicted {result['label']} "
-                f"(p={result['proba']:.3f}) "
-                f"novelty {result['novelty']:.3f} is_novel {result['is_novel']}",
-            )
-        finally:
-            self.call_from_thread(self._set_nose, "idle")
-            self.call_from_thread(self._refresh_coach)
             self.call_from_thread(self._clear_busy)
 
     # ----------------------------------------------------------- think
@@ -448,7 +500,6 @@ class SniffApp(App):
             client = llm.OpenRouterClient()
             narrative = reason(self._last_geometry, client)
         except Exception as exc:
-            # Includes LLMError (missing key hint) — never a traceback or a key.
             self.call_from_thread(self._log, str(exc))
         else:
             for line in str(narrative).splitlines() or [str(narrative)]:

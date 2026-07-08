@@ -61,14 +61,32 @@ def _sim_ctrl(tmp_path):
     )
 
 
+class _Silent:
+    """Frame source that yields nothing — the monitor worker starts + finishes at
+    once, and (real mode) never opens a serial port."""
+
+    def frames(self):
+        return iter(())
+
+    def close(self):
+        pass
+
+    def begin_odor(self, label, seed=None):
+        pass
+
+
+def _mk(ctrl):
+    return SniffApp(ctrl, source_factory=lambda c: _Silent(), paced=False)
+
+
 # C: interactive default is one sniff per press
 def test_default_reps_is_one(tmp_path):
-    assert SniffApp(_sim_ctrl(tmp_path)).reps == 1
+    assert _mk(_sim_ctrl(tmp_path)).reps == 1
 
 
 # A: sensor panel has content immediately after mount
 def test_sensorbars_populated_on_mount(tmp_path):
-    app = SniffApp(_sim_ctrl(tmp_path))
+    app = _mk(_sim_ctrl(tmp_path))
 
     async def scenario():
         async with app.run_test() as pilot:
@@ -83,24 +101,24 @@ def test_sensorbars_populated_on_mount(tmp_path):
     asyncio.run(scenario())
 
 
-# B: a second capture is refused while one is running
+# B: a second capture is refused while one is already being captured
 def test_record_busy_guard(tmp_path):
-    app = SniffApp(_sim_ctrl(tmp_path))
-    calls = {"n": 0}
+    from sniffsniff.monitor import ContinuousSim
+
+    app = _mk(_sim_ctrl(tmp_path))
 
     async def scenario():
         async with app.run_test() as pilot:
             await pilot.pause()
-            # pretend a capture is already running
-            app._busy = True
-            app._record_worker = lambda *a, **k: calls.__setitem__("n", calls["n"] + 1)
-            app.action_record()
-            await pilot.pause()
-            assert calls["n"] == 0  # worker NOT started while busy
-            log_text = str(app.query_one("#log").render()) if hasattr(
-                app.query_one("#log"), "render"
-            ) else ""
-            # a "busy" notice was logged (best-effort; the guard is the real assert)
+            # get the engine into an active capture (arm + one step promotes it)
+            app._engine.arm_capture("coffee")
+            app._engine.step(ContinuousSim(app.controller.config).read())
+            assert app._engine.capturing is True
+            logs = []
+            app._log = logs.append
+            app.action_record()  # must refuse while a sniff is being captured
+            assert app._engine.arm_capture("coffee") is False
+            assert any("busy" in m.lower() for m in logs)
 
     asyncio.run(scenario())
 
@@ -111,13 +129,12 @@ def test_real_mode_mount_warns_no_device(tmp_path):
         _fast(), out_dir=tmp_path, use_sim=False, port="/dev/cu.nope_xyz",
         model_path=str(tmp_path / "m.joblib"),
     )
+    app = _mk(ctrl)  # silent source -> mount doesn't try to open the missing port
     logs = []
-    app = SniffApp(ctrl)
+    app._log = logs.append  # spy set BEFORE mount so on_mount's warning is captured
 
     async def scenario():
         async with app.run_test() as pilot:
-            app._log = lambda msg: logs.append(msg)  # capture after mount's first log
-            app.on_mount()
             await pilot.pause()
 
     asyncio.run(scenario())
