@@ -21,6 +21,7 @@ from __future__ import annotations
 import numpy as np
 import joblib
 from scipy.stats import chi2
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
@@ -31,11 +32,51 @@ from sklearn.model_selection import (
     cross_val_score,
 )
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 __all__ = ["SmellModel", "cross_val_accuracy"]
+
+
+class _ColumnSelector(BaseEstimator, TransformerMixin):
+    """Select a fixed set of columns — used to graft chosen raw (scaled) features
+    onto the PCA scores for the classifier (see ``SmellModel.augment_features``)."""
+
+    def __init__(self, cols=()):
+        self.cols = tuple(cols)
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if not self.cols:
+            return np.empty((X.shape[0], 0), dtype=np.float64)
+        return X[:, list(self.cols)]
+
+
+def _resolve_augment_cols(augment_features, feature_names) -> list[int]:
+    """Column indices whose feature name matches any ``augment_features`` prefix.
+
+    A prefix like ``"MQ3"`` matches every ``"MQ3__<feat>"`` column (the 8 MQ3
+    features). Restoring these raw, discriminating columns to the classifier space
+    recovers axes the pooled, unsupervised PCA dilutes (e.g. MQ3 separates the
+    alcohol-bearing peppermint from cilantro). Returns ``[]`` when disabled.
+    """
+    if not augment_features:
+        return []
+    if feature_names is None:
+        raise ValueError(
+            "augment_features requires feature_names to resolve the columns"
+        )
+    names = list(feature_names)
+    prefixes = tuple(augment_features)
+    cols = [
+        i for i, nm in enumerate(names)
+        if any(nm == p or nm.startswith(p + "__") for p in prefixes)
+    ]
+    return cols
 
 
 def _make_classifier(name: str, n_samples: int):
@@ -71,6 +112,12 @@ class SmellModel:
     novelty_alpha:
         Chi-squared confidence level for the novelty threshold; the threshold is
         ``sqrt(chi2.ppf(novelty_alpha, df=k))`` where ``k`` is the fitted component count.
+    augment_features:
+        Optional sensor-name prefixes (e.g. ``("MQ3",)``) whose raw, standardized
+        features are grafted onto the PCA scores **for the classifier only** — the
+        map and novelty stay in the pure PCA space. This restores discriminating axes
+        the unsupervised PCA dilutes (MQ3 separates the alcohol-bearing peppermint
+        from cilantro). Requires ``feature_names`` at :meth:`fit`. ``None`` = pure PCA.
     """
 
     #: Number of PCA components used for the 2-D "smell map" (visualisation).
@@ -81,17 +128,26 @@ class SmellModel:
         n_components: int = 5,
         classifier: str = "knn",
         novelty_alpha: float = 0.975,
+        augment_features=None,
     ):
         self.n_components = int(n_components)
         self.classifier = str(classifier)
         self.novelty_alpha = float(novelty_alpha)
+        self.augment_features = tuple(augment_features) if augment_features else None
 
     # ------------------------------------------------------------------ fit
-    def fit(self, X, y) -> "SmellModel":
-        """Fit scaler, PCA, classifier, and per-class Mahalanobis statistics."""
+    def fit(self, X, y, feature_names=None) -> "SmellModel":
+        """Fit scaler, PCA, classifier, and per-class Mahalanobis statistics.
+
+        ``feature_names`` (length ``n_features``) is required only when
+        :attr:`augment_features` is set, to resolve which raw columns to graft onto
+        the classifier space.
+        """
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=str)
         n_samples, n_features = X.shape
+        if feature_names is not None:
+            self.feature_names_ = list(feature_names)
 
         # Clamp components to what the data can support (PCA needs k <= min(n, p);
         # covariances need headroom). n_components_ is the fitted working dimension.
@@ -103,8 +159,10 @@ class SmellModel:
         self.pca_ = PCA(n_components=self.n_components_, random_state=0).fit(scaled)
         scores = self.pca_.transform(scaled)
 
+        # Classifier trains on the (optionally augmented) space; novelty/map use `scores`.
+        self.augment_cols_ = _resolve_augment_cols(self.augment_features, feature_names)
         self.clf_ = _make_classifier(self.classifier, n_samples)
-        self.clf_.fit(scores, y)
+        self.clf_.fit(self._clf_features(scaled, scores), y)
 
         self.classes_ = sorted(set(y.tolist()))
         self.loadings_ = self.pca_.components_  # (k, 48)
@@ -144,18 +202,30 @@ class SmellModel:
         return self
 
     # ------------------------------------------------------------- inference
+    def _clf_features(self, scaled, scores) -> np.ndarray:
+        """The classifier's input: PCA ``scores`` optionally ⊕ selected raw columns."""
+        cols = getattr(self, "augment_cols_", [])
+        if not cols:
+            return scores
+        return np.hstack([scores, np.asarray(scaled)[:, cols]])
+
+    def _clf_input(self, X) -> np.ndarray:
+        """Scale ``X``, then build the classifier feature space (PCA ⊕ raw cols)."""
+        scaled = self.scaler_.transform(np.asarray(X, dtype=np.float64))
+        return self._clf_features(scaled, self.pca_.transform(scaled))
+
     def transform(self, X) -> np.ndarray:
-        """PCA scores ``(n, k)`` for ``X`` (scaler then PCA)."""
+        """PCA scores ``(n, k)`` for ``X`` — the map + novelty space (never augmented)."""
         X = np.asarray(X, dtype=np.float64)
         return self.pca_.transform(self.scaler_.transform(X))
 
     def predict(self, X) -> np.ndarray:
         """Predicted labels ``(n,)`` for ``X``."""
-        return self.clf_.predict(self.transform(X))
+        return self.clf_.predict(self._clf_input(X))
 
     def predict_proba(self, X) -> tuple[list[str], np.ndarray]:
         """``(classes, (n, C))`` class-probability estimates, columns = ``classes_``."""
-        proba = self.clf_.predict_proba(self.transform(X))
+        proba = self.clf_.predict_proba(self._clf_input(X))
         # Reorder columns to self.classes_ (clf_.classes_ may differ / be a subset).
         clf_classes = list(self.clf_.classes_)
         out = np.zeros((proba.shape[0], len(self.classes_)), dtype=np.float64)
@@ -202,13 +272,18 @@ def cross_val_accuracy(
     n_components: int = 5,
     classifier: str = "knn",
     groups=None,
+    augment_features=None,
+    feature_names=None,
 ) -> tuple[float, float]:
     """Cross-validated accuracy (mean, std) of the scale→PCA→classify pipeline.
 
     Uses :class:`StratifiedKFold` (``n_splits = min(5, min_class_count)``), falling
     back to :class:`LeaveOneOut` when the rarest class has fewer than 3 members. If
     ``groups`` (e.g. sniff ids) is given, :class:`GroupKFold` prevents same-group
-    leakage across folds. The full pipeline is rebuilt inside every fold.
+    leakage across folds. The full pipeline is rebuilt inside every fold. When
+    ``augment_features`` is set, the classifier stage sees the PCA scores grafted with
+    the matching raw (scaled) columns — mirroring :class:`SmellModel` — so the reported
+    accuracy reflects the augmented space.
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=str)
@@ -227,10 +302,18 @@ def cross_val_accuracy(
     min_train = n_samples - int(np.ceil(n_samples / n_splits))
     k = max(1, min(n_components, n_features, max(1, min_train)))
 
+    augment_cols = _resolve_augment_cols(augment_features, feature_names)
+    if augment_cols:
+        features = FeatureUnion([
+            ("pca", PCA(n_components=k, random_state=0)),
+            ("raw", _ColumnSelector(augment_cols)),
+        ])
+    else:
+        features = PCA(n_components=k, random_state=0)
     pipeline = Pipeline(
         [
             ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=k, random_state=0)),
+            ("features", features),
             ("clf", _make_classifier(classifier, n_samples)),
         ]
     )

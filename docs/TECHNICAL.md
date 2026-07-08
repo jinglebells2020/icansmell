@@ -504,6 +504,16 @@ design rather than being cited for specific numeric claims.)*
   reports **~0.93 ± 0.13** cross-validated accuracy (kNN, grouped CV). A live identify
   sniff after retraining predicted `fresh_milk` at **p = 1.00** with novelty 0.30 (well
   below threshold — not flagged novel), confirming the full record → fit → identify loop.
+- **Two confusion classes, opposite fixes (6-class rig data — verified by testing each pair
+  in full 48-D vs PCA-5D):** *peppermint ↔ cilantro* is a **representation** artifact — the
+  MQ3 (alcohol) axis separates them perfectly (peppermint's menthol is a terpene alcohol),
+  but the unsupervised PCA-5D diluted it. Grafting the raw MQ3 features onto the classifier
+  space (`SmellModel.augment_features`, novelty/map stay pure-PCA) lifts grouped-CV **0.80 →
+  0.90** at zero cost to other pairs. *fresh_milk ↔ cinnamon* is **structural** — no software
+  feature (raw, ratio, or kinetic) separates them in honest CV (both near-identical on this
+  array); breaking it needs a new sensing dimension (an aldehyde-selective sensor such as
+  **MQ-9** — cinnamaldehyde drives it, milk does not). Chemistry-proposed ratio features were
+  tested and **refuted** (2-class small-sample artifacts that hurt honest 6-class CV).
 
 ---
 

@@ -62,6 +62,11 @@ class SniffController:
         self.seed = seed
         self.model_path = model_path
         self.classifier = "knn"  # settable; fit() uses it, `c` cycles it
+        # Graft these raw sensor features onto the classifier's PCA space (novelty/map
+        # stay pure PCA). MQ3 is the alcohol axis the unsupervised PCA dilutes; adding
+        # it back separated peppermint (menthol) from cilantro — validated 0.80→0.90 on
+        # the real rig. Set to () to disable.
+        self.augment_features = ("MQ3",)
 
     # ---------------------------------------------------------------- status
     @property
@@ -261,11 +266,16 @@ class SniffController:
                 "need at least 2 labeled classes to fit a model; "
                 f"found {ds.classes}"
             )
-        model = SmellModel(classifier=clf).fit(ds.X, ds.y)
-        model.feature_names_ = list(ds.feature_names)
+        aug = self.augment_features or None
+        names = list(ds.feature_names)
+        model = SmellModel(classifier=clf, augment_features=aug).fit(
+            ds.X, ds.y, feature_names=names
+        )
+        model.feature_names_ = names
         model.save(self.model_path)
         return cross_val_accuracy(
-            ds.X, ds.y, classifier=clf, groups=ds.ids
+            ds.X, ds.y, classifier=clf, groups=ds.ids,
+            augment_features=aug, feature_names=names,
         )
 
     # -------------------------------------------------------------- identify

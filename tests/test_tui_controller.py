@@ -221,9 +221,9 @@ def test_fit_uses_self_classifier(tmp_path):
     seen = {}
     orig_cva = ctrl_mod.cross_val_accuracy
 
-    def _spy_cva(X, y, *, classifier="knn", groups=None):
+    def _spy_cva(X, y, *, classifier="knn", groups=None, **kw):
         seen["classifier"] = classifier
-        return orig_cva(X, y, classifier=classifier, groups=groups)
+        return orig_cva(X, y, classifier=classifier, groups=groups, **kw)
 
     ctrl_mod.cross_val_accuracy = _spy_cva
     try:

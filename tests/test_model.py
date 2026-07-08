@@ -142,3 +142,51 @@ def test_other_classifiers_fit_and_predict(dataset):
 def test_invalid_classifier_raises(dataset):
     with pytest.raises((ValueError, KeyError)):
         SmellModel(classifier="bogus").fit(dataset.X, dataset.y)
+
+
+# --- classifier-space augmentation (chemistry-informed discriminating axes) ----
+
+def test_augment_default_is_pure_pca_backward_compatible(dataset):
+    """Default (no augment) must behave exactly like the old pure-PCA model."""
+    m = SmellModel(n_components=2, classifier="knn").fit(dataset.X, dataset.y)
+    assert m.augment_cols_ == []                       # nothing grafted
+    # transform() (map + novelty space) is pure PCA of width n_components_
+    assert m.transform(dataset.X).shape[1] == m.n_components_
+
+
+def test_augment_grafts_named_columns_onto_classifier_only(dataset):
+    names = list(dataset.feature_names)
+    m = SmellModel(n_components=2, classifier="knn", augment_features=("MQ3",))
+    m.fit(dataset.X, dataset.y, feature_names=names)
+    # resolves exactly the MQ3 columns
+    expected = [i for i, nm in enumerate(names) if nm.startswith("MQ3__")]
+    assert m.augment_cols_ == expected and len(expected) == 8
+    # novelty/map space is UNCHANGED (still pure PCA), only the classifier sees more
+    assert m.transform(dataset.X).shape[1] == m.n_components_
+    assert m._clf_input(dataset.X).shape[1] == m.n_components_ + len(expected)
+    # still a working classifier
+    assert m.predict(dataset.X).shape == (dataset.X.shape[0],)
+
+
+def test_augment_requires_feature_names(dataset):
+    m = SmellModel(classifier="knn", augment_features=("MQ3",))
+    with pytest.raises(ValueError):
+        m.fit(dataset.X, dataset.y)  # no feature_names -> can't resolve columns
+
+
+def test_augment_save_load_round_trips(dataset, tmp_path):
+    names = list(dataset.feature_names)
+    m = SmellModel(n_components=2, classifier="knn", augment_features=("MQ3",))
+    m.fit(dataset.X, dataset.y, feature_names=names)
+    path = tmp_path / "aug.joblib"
+    m.save(path)
+    loaded = SmellModel.load(path)
+    assert np.array_equal(m.predict(dataset.X), loaded.predict(dataset.X))
+
+
+def test_cross_val_accuracy_augment_runs(dataset):
+    mean, std = cross_val_accuracy(
+        dataset.X, dataset.y, classifier="knn",
+        augment_features=("MQ3",), feature_names=list(dataset.feature_names),
+    )
+    assert 0.0 <= mean <= 1.0 and std >= 0.0
