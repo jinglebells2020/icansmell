@@ -21,11 +21,25 @@ from ..capture import capture_session
 from ..dataset import load_dataset
 from ..geometry import serialize_geometry
 from ..model import SmellModel, cross_val_accuracy
-from ..record import SniffRecorder
+from ..record import SniffRecorder, clear_dataset, delete_last_sniff
 from ..serialio import SerialReader
 from ..simulator import SimulatedReader, Simulator
 
-__all__ = ["SniffController"]
+__all__ = [
+    "SniffController",
+    "DEFAULT_LABELS",
+    "CLASSIFIERS",
+    "GOOD_REPS",
+    "MIN_CLASSES",
+]
+
+# The demo labels the coach nudges toward; recorded-but-novel labels are appended.
+DEFAULT_LABELS = ["coffee", "vinegar", "alcohol", "fresh_milk", "spoiled_milk"]
+# Classifier cycle order for the `c` key; must match SmellModel's supported set.
+CLASSIFIERS = ["knn", "svm", "rf", "lda"]
+# Per-label target the coach nudges toward, and the minimum classes to fit.
+GOOD_REPS = 3
+MIN_CLASSES = 2
 
 
 class SniffController:
@@ -47,6 +61,7 @@ class SniffController:
         self.port = port
         self.seed = seed
         self.model_path = model_path
+        self.classifier = "knn"  # settable; fit() uses it, `c` cycles it
 
     # ---------------------------------------------------------------- status
     @property
@@ -159,20 +174,98 @@ class SniffController:
             counts[label] = counts.get(label, 0) + 1
         return counts
 
+    # --------------------------------------------------------- dataset mgmt
+    def known_labels(self) -> list[str]:
+        """:data:`DEFAULT_LABELS` plus any recorded label not already a default.
+
+        Stable order: defaults first (in their canonical order), then novel
+        recorded labels in ``dataset_counts`` order. No duplicates.
+        """
+        labels = list(DEFAULT_LABELS)
+        seen = set(labels)
+        for label in self.dataset_counts():
+            if label not in seen:
+                labels.append(label)
+                seen.add(label)
+        return labels
+
+    def delete_last(self, label) -> "Path | None":
+        """Delete the most-recent sniff for ``label``; see :func:`delete_last_sniff`."""
+        return delete_last_sniff(self.out_dir, label)
+
+    def clear(self) -> int:
+        """Delete the whole dataset under :attr:`out_dir`; return #sniffs removed."""
+        return clear_dataset(self.out_dir)
+
+    def cycle_classifier(self) -> str:
+        """Advance :attr:`classifier` to the next in :data:`CLASSIFIERS`; return it."""
+        try:
+            idx = CLASSIFIERS.index(self.classifier)
+        except ValueError:
+            idx = -1
+        self.classifier = CLASSIFIERS[(idx + 1) % len(CLASSIFIERS)]
+        return self.classifier
+
+    def ready_to_fit(self) -> bool:
+        """True when ≥ :data:`MIN_CLASSES` labels each have ≥1 recorded sniff."""
+        counts = self.dataset_counts()
+        with_data = [lbl for lbl, n in counts.items() if n > 0]
+        return len(with_data) >= MIN_CLASSES
+
+    def next_step(self) -> str:
+        """The coach guidance string reflecting the current state.
+
+        Precedence: not-connected → not-enough-classes → below-target →
+        enough → trained.
+        """
+        if not self.connected:
+            return "Connect a device, or press s for the simulator."
+
+        counts = self.dataset_counts()
+        with_data = {lbl: n for lbl, n in counts.items() if n > 0}
+
+        if len(with_data) < MIN_CLASSES:
+            return (
+                "Record sniffs for another label. Pick a label (n/p), press r."
+            )
+
+        below = [
+            f"{lbl} ({counts.get(lbl, 0)}/{GOOD_REPS})"
+            for lbl in self.known_labels()
+            if 0 < counts.get(lbl, 0) < GOOD_REPS
+        ]
+        if not self.has_model():
+            if below:
+                return "Collect more: " + ", ".join(below) + ". Press r."
+            return "Enough data — press f to train."
+
+        # A model exists.
+        if below:
+            return (
+                "Trained ✓ — collect more ("
+                + ", ".join(below)
+                + ") or press i to identify, m for the smell map."
+            )
+        return "Trained ✓ — press i to identify, m for the smell map."
+
     # ------------------------------------------------------------------- fit
-    def fit(self, classifier="knn") -> tuple[float, float]:
-        """Train + persist the smell model; return cross-validated (mean, std)."""
+    def fit(self, classifier=None) -> tuple[float, float]:
+        """Train + persist the smell model; return cross-validated (mean, std).
+
+        Uses :attr:`classifier` when ``classifier`` is not given explicitly.
+        """
+        clf = self.classifier if classifier is None else classifier
         ds = load_dataset(self.out_dir)
         if len(ds.classes) < 2:
             raise ValueError(
                 "need at least 2 labeled classes to fit a model; "
                 f"found {ds.classes}"
             )
-        model = SmellModel(classifier=classifier).fit(ds.X, ds.y)
+        model = SmellModel(classifier=clf).fit(ds.X, ds.y)
         model.feature_names_ = list(ds.feature_names)
         model.save(self.model_path)
         return cross_val_accuracy(
-            ds.X, ds.y, classifier=classifier, groups=ds.ids
+            ds.X, ds.y, classifier=clf, groups=ds.ids
         )
 
     # -------------------------------------------------------------- identify

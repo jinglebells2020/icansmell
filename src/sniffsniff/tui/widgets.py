@@ -110,6 +110,39 @@ def render_workflow(
     return "\n".join(lines)
 
 
+def render_label_list(
+    labels: list[str],
+    counts: dict[str, int],
+    current: Optional[str] = None,
+) -> str:
+    """Pure body for :class:`LabelList`: one row per label, current marked.
+
+    ``"▸ coffee     3"`` for the current label, ``"  vinegar    0"`` otherwise.
+    Counts default to ``0`` for labels absent from ``counts``.
+    """
+    rows = []
+    for label in labels:
+        marker = "▸" if label == current else " "
+        n = counts.get(label, 0)
+        rows.append(f"{marker} {label:<14} {n}")
+    return "\n".join(rows)
+
+
+def render_coach(
+    next_step: str,
+    connected: bool,
+    label: str,
+    reps: int,
+    classifier: str,
+    has_model: bool,
+) -> str:
+    """Pure body for :class:`CoachPanel`: a status header + a ``NEXT:`` line."""
+    src = "connected" if connected else "offline"
+    model = "model ✓" if has_model else "model ✗"
+    header = f"{src} | label: {label} | reps: {reps} | clf: {classifier} | {model}"
+    return f"{header}\n\nNEXT: {next_step}"
+
+
 try:  # textual is an optional extra; render helpers above import without it.
     from textual.widgets import RichLog, Static
 
@@ -154,6 +187,35 @@ try:  # textual is an optional extra; render helpers above import without it.
         ) -> None:
             self.update(render_workflow(connected, counts, has_model))
 
+    class LabelList(Static):
+        """One row per known label with its count; the current label marked."""
+
+        def update_labels(
+            self,
+            labels: list[str],
+            counts: dict[str, int],
+            current: Optional[str] = None,
+        ) -> None:
+            self.update(render_label_list(labels, counts, current))
+
+    class CoachPanel(Static):
+        """A status header + wrapped ``NEXT:`` guidance line."""
+
+        def update_coach(
+            self,
+            next_step: str,
+            connected: bool,
+            label: str,
+            reps: int,
+            classifier: str,
+            has_model: bool,
+        ) -> None:
+            self.update(
+                render_coach(
+                    next_step, connected, label, reps, classifier, has_model
+                )
+            )
+
     class LogPanel(RichLog):
         """A scrolling event log."""
 
@@ -168,6 +230,8 @@ try:  # textual is an optional extra; render helpers above import without it.
 except ImportError:  # pragma: no cover - exercised only when textual is absent
     SensorBars = None  # type: ignore[assignment,misc]
     WorkflowPanel = None  # type: ignore[assignment,misc]
+    LabelList = None  # type: ignore[assignment,misc]
+    CoachPanel = None  # type: ignore[assignment,misc]
 
     class LogPanel:  # type: ignore[no-redef]
         """Textual-free fallback: keep the last ``max_lines`` messages in a deque."""

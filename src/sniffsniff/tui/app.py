@@ -7,6 +7,10 @@ rendering the map) runs in ``@work(thread=True)`` worker threads so the event
 loop stays responsive; those workers touch widgets *only* through
 :meth:`textual.app.App.call_from_thread`.
 
+v2 turns it into a *guided training console*: a live per-label list, a coach line
+that always says the next step, and the ability to fix mistakes (delete the last
+sniff, clear + restart).
+
 ``textual`` is an optional extra, so this module is imported lazily from the CLI
 (``_cmd_tui``). Importing it without ``textual`` installed raises ``ImportError``,
 which the CLI turns into a friendly install hint.
@@ -16,17 +20,37 @@ from __future__ import annotations
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header
+from textual.screen import ModalScreen
+from textual.widgets import Footer, Header, Input, Label
 
-from .controller import SniffController
+from .controller import CLASSIFIERS, SniffController
 from .nose import NoseWidget
-from .widgets import LogPanel, SensorBars, WorkflowPanel
+from .widgets import CoachPanel, LabelList, LogPanel, SensorBars, WorkflowPanel
 
 __all__ = ["SniffApp", "run_tui"]
 
-# The five demo odors; the first is the default record label. Pressing ``l``
-# cycles through them.
-_ODORS = ["coffee", "vinegar", "alcohol", "fresh_milk", "spoiled_milk"]
+
+class _AddLabelScreen(ModalScreen[str]):
+    """A tiny modal with an ``Input`` for adding a custom label."""
+
+    CSS = """
+    _AddLabelScreen { align: center middle; }
+    #box { width: 50; height: auto; border: round $accent; padding: 1; background: $surface; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Label("New label (Enter to add, Esc to cancel):")
+            yield Input(placeholder="e.g. garlic", id="label_input")
+
+    def on_mount(self) -> None:
+        self.query_one("#label_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
+
+    def key_escape(self) -> None:
+        self.dismiss("")
 
 
 class SniffApp(App):
@@ -35,20 +59,29 @@ class SniffApp(App):
     CSS = """
     #body { height: 1fr; }
     #left { width: 1fr; }
-    #right { width: 1fr; }
+    #right { width: 2fr; }
     NoseWidget { height: auto; border: round $accent; padding: 1; }
-    WorkflowPanel { height: 1fr; border: round $primary; padding: 1; }
+    LabelList { height: 1fr; border: round $primary; padding: 1; }
+    CoachPanel { height: auto; border: round $warning; padding: 1; }
+    WorkflowPanel { height: auto; border: round $primary; padding: 1; }
     SensorBars { height: auto; border: round $secondary; padding: 1; }
     LogPanel { height: 1fr; border: round $panel; }
     """
 
     BINDINGS = [
-        ("r", "record", "Record"),
+        ("r", "record", "Rec"),
+        ("n", "next_label", "Next label"),
+        ("p", "prev_label", "Prev label"),
+        ("a", "add_label", "Add label"),
+        ("plus", "more_reps", "+reps"),
+        ("minus", "fewer_reps", "-reps"),
+        ("c", "cycle_classifier", "Clf"),
+        ("x", "delete_last", "Del"),
+        ("X", "clear", "Clear"),
         ("f", "fit", "Fit"),
         ("i", "identify", "Identify"),
         ("m", "map", "Map"),
         ("s", "toggle_sim", "Sim/Real"),
-        ("l", "cycle_label", "Label"),
         ("q", "quit", "Quit"),
     ]
 
@@ -58,8 +91,9 @@ class SniffApp(App):
         super().__init__()
         self.controller = controller
         self.reps = reps
-        self.label = label or _ODORS[0]
+        self.label = label or controller.known_labels()[0]
         self._busy = False  # a capture/fit/map is running — refuse a second
+        self._clear_armed = False  # first X arms, second X within focus confirms
 
     # ------------------------------------------------------------- layout
     def compose(self) -> ComposeResult:
@@ -67,6 +101,8 @@ class SniffApp(App):
         with Horizontal(id="body"):
             with Vertical(id="left"):
                 yield NoseWidget(id="nose")
+                yield LabelList(id="labels")
+                yield CoachPanel(id="coach")
                 yield WorkflowPanel(id="workflow")
             with Vertical(id="right"):
                 yield SensorBars(id="sensors")
@@ -82,7 +118,7 @@ class SniffApp(App):
         self.query_one("#sensors", SensorBars).update_values(
             names, np.zeros(len(names)), phase="idle"
         )
-        self._refresh_workflow()
+        self._refresh_all()
         mode = "sim" if self.controller.use_sim else "real"
         self._log(f"ready — label '{self.label}', {mode}")
         # In real mode with no device present, say so loudly instead of failing later.
@@ -101,6 +137,29 @@ class SniffApp(App):
             ctrl.connected, ctrl.dataset_counts(), ctrl.has_model()
         )
 
+    def _refresh_labels(self) -> None:
+        ctrl = self.controller
+        self.query_one("#labels", LabelList).update_labels(
+            ctrl.known_labels(), ctrl.dataset_counts(), self.label
+        )
+
+    def _refresh_coach(self) -> None:
+        ctrl = self.controller
+        self.query_one("#coach", CoachPanel).update_coach(
+            ctrl.next_step(),
+            ctrl.connected,
+            self.label,
+            self.reps,
+            ctrl.classifier,
+            ctrl.has_model(),
+        )
+
+    def _refresh_all(self) -> None:
+        """Refresh label list + coach + workflow (the three state panels)."""
+        self._refresh_labels()
+        self._refresh_coach()
+        self._refresh_workflow()
+
     def _set_nose(self, state: str) -> None:
         self.query_one("#nose", NoseWidget).set_state(state)
 
@@ -114,16 +173,65 @@ class SniffApp(App):
             return True
         return False
 
-    # ------------------------------------------------------- no-op-ish
-    def action_cycle_label(self) -> None:
-        idx = (_ODORS.index(self.label) + 1) % len(_ODORS) if self.label in _ODORS else 0
-        self.label = _ODORS[idx]
+    def _disarm_clear(self) -> None:
+        """Any action other than a second X cancels a pending clear confirmation."""
+        self._clear_armed = False
+
+    # ------------------------------------------------------- label / reps
+    def action_next_label(self) -> None:
+        self._disarm_clear()
+        labels = self.controller.known_labels()
+        idx = labels.index(self.label) if self.label in labels else -1
+        self.label = labels[(idx + 1) % len(labels)]
         self._log(f"label → {self.label}")
+        self._refresh_labels()
+        self._refresh_coach()
+
+    def action_prev_label(self) -> None:
+        self._disarm_clear()
+        labels = self.controller.known_labels()
+        idx = labels.index(self.label) if self.label in labels else 0
+        self.label = labels[(idx - 1) % len(labels)]
+        self._log(f"label → {self.label}")
+        self._refresh_labels()
+        self._refresh_coach()
+
+    def action_add_label(self) -> None:
+        self._disarm_clear()
+
+        def _done(value: str | None) -> None:
+            if value:
+                self.label = value
+                self._log(f"added label → {self.label}")
+                self._refresh_labels()
+                self._refresh_coach()
+
+        self.push_screen(_AddLabelScreen(), _done)
+
+    def action_more_reps(self) -> None:
+        self._disarm_clear()
+        self.reps += 1
+        self._log(f"reps → {self.reps}")
+        self._refresh_coach()
+
+    def action_fewer_reps(self) -> None:
+        self._disarm_clear()
+        if self.reps > 1:
+            self.reps -= 1
+        self._log(f"reps → {self.reps}")
+        self._refresh_coach()
+
+    def action_cycle_classifier(self) -> None:
+        self._disarm_clear()
+        new = self.controller.cycle_classifier()
+        self._log(f"classifier → {new}")
+        self._refresh_coach()
 
     def action_toggle_sim(self) -> None:
         """Flip the sim/real flag by rebuilding the controller in place."""
+        self._disarm_clear()
         ctrl = self.controller
-        self.controller = SniffController(
+        new = SniffController(
             ctrl.config,
             out_dir=ctrl.out_dir,
             use_sim=not ctrl.use_sim,
@@ -131,11 +239,14 @@ class SniffApp(App):
             seed=ctrl.seed,
             model_path=ctrl.model_path,
         )
+        new.classifier = ctrl.classifier  # preserve the chosen classifier
+        self.controller = new
         self._log(f"source → {'sim' if self.controller.use_sim else 'real'}")
-        self._refresh_workflow()
+        self._refresh_all()
 
     # ---------------------------------------------------------- record
     def action_record(self) -> None:
+        self._disarm_clear()
         if self._reject_if_busy():
             return
         self._busy = True
@@ -170,7 +281,7 @@ class SniffApp(App):
 
         def on_saved(path, i: int) -> None:
             self.call_from_thread(self._log, f"saved {path.name} ({i + 1}/{reps})")
-            self.call_from_thread(self._refresh_workflow)
+            self.call_from_thread(self._refresh_all)
 
         try:
             ctrl.record_many(
@@ -184,15 +295,70 @@ class SniffApp(App):
             self.call_from_thread(self._log, f"record failed: {exc}")
         finally:
             self.call_from_thread(self._set_nose, "idle")
-            self.call_from_thread(self._refresh_workflow)
+            self.call_from_thread(self._refresh_all)
+            self.call_from_thread(self._clear_busy)
+
+    # ----------------------------------------------------- delete / clear
+    def action_delete_last(self) -> None:
+        self._disarm_clear()
+        if self._reject_if_busy():
+            return
+        self._busy = True
+        self._delete_worker(self.label)
+
+    @work(thread=True)
+    def _delete_worker(self, label: str) -> None:
+        try:
+            deleted = self.controller.delete_last(label)
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            self.call_from_thread(self._log, f"delete failed: {exc}")
+        else:
+            if deleted is None:
+                self.call_from_thread(
+                    self._log, f"nothing to delete for '{label}'"
+                )
+            else:
+                self.call_from_thread(
+                    self._log, f"deleted {deleted.name} (undo capture)"
+                )
+        finally:
+            self.call_from_thread(self._refresh_all)
+            self.call_from_thread(self._clear_busy)
+
+    def action_clear(self) -> None:
+        if self._reject_if_busy():
+            return
+        if not self._clear_armed:
+            self._clear_armed = True
+            self._log("press X again to confirm clearing the whole dataset")
+            return
+        self._clear_armed = False
+        self._busy = True
+        self._log("clearing dataset …")
+        self._clear_worker()
+
+    @work(thread=True)
+    def _clear_worker(self) -> None:
+        try:
+            removed = self.controller.clear()
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            self.call_from_thread(self._log, f"clear failed: {exc}")
+        else:
+            self.call_from_thread(self._log, f"cleared {removed} sniff(s)")
+        finally:
+            self.call_from_thread(self._refresh_all)
             self.call_from_thread(self._clear_busy)
 
     # ------------------------------------------------------------- fit
     def action_fit(self) -> None:
+        self._disarm_clear()
         if self._reject_if_busy():
             return
+        if not self.controller.ready_to_fit():
+            self._log("fit: need ≥2 labels with data — record more first")
+            return
         self._busy = True
-        self._log("fitting model …")
+        self._log(f"fitting model ({self.controller.classifier}) …")
         self._fit_worker()
 
     @work(thread=True)
@@ -203,14 +369,15 @@ class SniffApp(App):
             self.call_from_thread(self._log, f"fit failed: {exc}")
         else:
             self.call_from_thread(
-                self._log, f"cross-val accuracy {mean:.3f} ± {std:.3f}"
+                self._log, f"trained ✓ cross-val accuracy {mean:.3f} ± {std:.3f}"
             )
         finally:
-            self.call_from_thread(self._refresh_workflow)
+            self.call_from_thread(self._refresh_all)
             self.call_from_thread(self._clear_busy)
 
     # -------------------------------------------------------- identify
     def action_identify(self) -> None:
+        self._disarm_clear()
         if self._reject_if_busy():
             return
         if not self.controller.has_model():
@@ -251,10 +418,12 @@ class SniffApp(App):
             )
         finally:
             self.call_from_thread(self._set_nose, "idle")
+            self.call_from_thread(self._refresh_coach)
             self.call_from_thread(self._clear_busy)
 
     # ------------------------------------------------------------- map
     def action_map(self) -> None:
+        self._disarm_clear()
         if self._reject_if_busy():
             return
         if not self.controller.has_model():

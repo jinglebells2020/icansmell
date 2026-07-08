@@ -30,6 +30,8 @@ __all__ = [
     "phase_slices",
     "SniffResult",
     "SniffRecorder",
+    "delete_last_sniff",
+    "clear_dataset",
 ]
 
 _MANIFEST_HEADER = ["id", "label", "path", "n_samples"]
@@ -300,3 +302,87 @@ class SniffRecorder:
         """Convenience: :meth:`process` then :meth:`save`; returns the npz path."""
         result = self.process(frames, label)
         return self.save(result)
+
+
+# -- dataset management (module-level; no recorder instance needed) ----------
+def _sniff_seq(sniff_id: str) -> int | None:
+    """Parse the trailing ``_NNNN`` sequence number from a sniff id, or ``None``."""
+    _, sep, tail = sniff_id.rpartition("_")
+    if not sep or not tail.isdigit():
+        return None
+    return int(tail)
+
+
+def delete_last_sniff(out_dir, label) -> Path | None:
+    """Remove the most-recent sniff for ``label`` from the dataset.
+
+    "Most-recent" is the manifest row with matching ``label`` and the highest
+    trailing ``_NNNN`` sequence id (falling back to the last matching row in file
+    order if no id parses). Deletes that row's ``.npz`` (the manifest ``path``
+    column) and rewrites ``manifest.csv`` without the row, preserving the header
+    and the order of all other rows. Returns the deleted :class:`Path`, or
+    ``None`` when no sniff with that label exists.
+    """
+    out_dir = Path(out_dir)
+    manifest = out_dir / "manifest.csv"
+    if not manifest.exists():
+        return None
+
+    with manifest.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or list(_MANIFEST_HEADER)
+        rows = list(reader)
+
+    # Pick the matching row with the highest parsed sequence id; on ties or
+    # unparseable ids, prefer the later row in file order.
+    best_idx = None
+    best_key = None
+    for i, row in enumerate(rows):
+        if row.get("label") != label:
+            continue
+        seq = _sniff_seq(row.get("id", ""))
+        # (has_seq, seq_value, file_index) orders unparseable rows below parsed
+        # ones but still breaks ties toward the later row.
+        key = (seq is not None, seq if seq is not None else -1, i)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_idx = i
+
+    if best_idx is None:
+        return None
+
+    victim = rows.pop(best_idx)
+    npz_path = Path(victim["path"])
+    if npz_path.exists():
+        npz_path.unlink()
+
+    with manifest.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return npz_path
+
+
+def clear_dataset(out_dir) -> int:
+    """Delete every ``<label>/*.npz`` and ``manifest.csv`` under ``out_dir``.
+
+    Only ``*.npz`` files (in label subdirectories) and ``manifest.csv`` are
+    removed; any other files are left untouched. Returns the number of ``.npz``
+    files deleted. A missing ``out_dir`` is fine and returns ``0``.
+    """
+    out_dir = Path(out_dir)
+    if not out_dir.exists():
+        return 0
+
+    removed = 0
+    for npz_path in out_dir.glob("*/*.npz"):
+        if npz_path.is_file():
+            npz_path.unlink()
+            removed += 1
+
+    manifest = out_dir / "manifest.csv"
+    if manifest.exists():
+        manifest.unlink()
+
+    return removed

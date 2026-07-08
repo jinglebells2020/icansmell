@@ -153,3 +153,162 @@ def test_stream_stops(tmp_path):
     # Stop after 5 frames.
     ctrl.stream(on_frame, lambda: len(seen) >= 5, odor="coffee")
     assert len(seen) == 5
+
+
+# --- v2 guided-training controller additions --------------------------------
+
+from sniffsniff.tui.controller import CLASSIFIERS, DEFAULT_LABELS, GOOD_REPS
+
+
+def test_default_classifier_is_knn(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    assert ctrl.classifier == "knn"
+
+
+def test_known_labels_includes_defaults_and_recorded(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    # With nothing recorded, exactly the defaults, in order.
+    assert ctrl.known_labels() == list(DEFAULT_LABELS)
+
+    ctrl.record_many("coffee", 1)  # a default
+    # A novel label the simulator doesn't know: record real sim frames but
+    # persist them under the new label directly via the recorder.
+    from sniffsniff.record import SniffRecorder
+    from sniffsniff.simulator import Simulator
+
+    frames = Simulator(ctrl.config, seed=1).sniff_frames("coffee")
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        SniffRecorder(ctrl.config, ctrl.out_dir).record(frames, "garlic")
+
+    known = ctrl.known_labels()
+    # Defaults preserved, in order, first.
+    assert known[: len(DEFAULT_LABELS)] == list(DEFAULT_LABELS)
+    # Recorded-but-novel labels appended (once), after the defaults.
+    assert "garlic" in known
+    assert known.count("garlic") == 1
+    assert known.count("coffee") == 1  # not duplicated even though recorded
+
+
+def test_cycle_classifier_advances_and_wraps(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    seq = [ctrl.cycle_classifier() for _ in range(len(CLASSIFIERS) + 1)]
+    # First call moves off "knn" to the next, and after a full cycle we wrap.
+    assert seq[: len(CLASSIFIERS)] == CLASSIFIERS[1:] + CLASSIFIERS[:1]
+    assert seq[len(CLASSIFIERS)] == seq[0]
+    assert ctrl.classifier == seq[-1]
+
+
+def test_ready_to_fit_needs_two_labels(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    assert ctrl.ready_to_fit() is False
+    ctrl.record_many("coffee", 1)
+    assert ctrl.ready_to_fit() is False  # only one class
+    ctrl.record_many("vinegar", 1)
+    assert ctrl.ready_to_fit() is True
+
+
+def test_fit_uses_self_classifier(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    ctrl.record_many("coffee", 3)
+    ctrl.record_many("vinegar", 3)
+    ctrl.classifier = "lda"
+
+    import sniffsniff.tui.controller as ctrl_mod
+
+    seen = {}
+    orig_cva = ctrl_mod.cross_val_accuracy
+
+    def _spy_cva(X, y, *, classifier="knn", groups=None):
+        seen["classifier"] = classifier
+        return orig_cva(X, y, classifier=classifier, groups=groups)
+
+    ctrl_mod.cross_val_accuracy = _spy_cva
+    try:
+        ctrl.fit()
+    finally:
+        ctrl_mod.cross_val_accuracy = orig_cva
+    assert seen["classifier"] == "lda"
+
+
+def test_delete_last_removes_most_recent(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    ctrl.record_many("coffee", 3)
+    assert ctrl.dataset_counts()["coffee"] == 3
+
+    deleted = ctrl.delete_last("coffee")
+    assert deleted is not None
+    assert deleted.stem == "coffee_0002"
+    assert ctrl.dataset_counts().get("coffee", 0) == 2
+
+    # dataset still loads cleanly (manifest valid).
+    from sniffsniff.dataset import load_dataset
+
+    ds = load_dataset(ctrl.out_dir)
+    assert ds.y.tolist().count("coffee") == 2
+
+
+def test_delete_last_unknown_is_none(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    ctrl.record_many("coffee", 1)
+    assert ctrl.delete_last("banana") is None
+
+
+def test_clear_empties_dataset(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    ctrl.record_many("coffee", 2)
+    ctrl.record_many("vinegar", 1)
+    removed = ctrl.clear()
+    assert removed == 3
+    assert ctrl.dataset_counts() == {}
+
+
+def test_next_step_not_connected(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    ctrl.use_sim = False
+    ctrl.port = "/dev/cu.nope_xyz"
+    assert not ctrl.connected
+    msg = ctrl.next_step()
+    assert "connect" in msg.lower() or "simulator" in msg.lower()
+
+
+def test_next_step_needs_more_labels(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    # No data yet: coach nudges toward recording another label.
+    msg = ctrl.next_step()
+    assert "label" in msg.lower() or "record" in msg.lower()
+
+    ctrl.record_many("coffee", GOOD_REPS)
+    # One label only — still needs a second class.
+    msg = ctrl.next_step()
+    assert "label" in msg.lower() or "another" in msg.lower()
+
+
+def test_next_step_collect_more_below_target(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    ctrl.record_many("coffee", GOOD_REPS)
+    ctrl.record_many("vinegar", 1)  # below GOOD_REPS
+    msg = ctrl.next_step()
+    # Ready to fit (2 classes), but coach still nudges to collect more.
+    assert ctrl.ready_to_fit()
+    assert "vinegar" in msg or "collect" in msg.lower() or "more" in msg.lower()
+
+
+def test_next_step_enough_data(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    ctrl.record_many("coffee", GOOD_REPS)
+    ctrl.record_many("vinegar", GOOD_REPS)
+    msg = ctrl.next_step()
+    assert "enough" in msg.lower() or ("f" in msg.lower() and "train" in msg.lower())
+
+
+def test_next_step_trained(tmp_path):
+    ctrl, _ = _controller(tmp_path)
+    ctrl.record_many("coffee", GOOD_REPS)
+    ctrl.record_many("vinegar", GOOD_REPS)
+    ctrl.fit()
+    assert ctrl.has_model()
+    msg = ctrl.next_step()
+    assert "trained" in msg.lower() or "identify" in msg.lower()

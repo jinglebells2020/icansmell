@@ -4,6 +4,8 @@ import pytest
 
 from sniffsniff.tui.widgets import (
     bar_row,
+    render_coach,
+    render_label_list,
     render_sensor_bars,
     render_workflow,
 )
@@ -107,15 +109,79 @@ def test_render_workflow_connected_with_counts_and_model():
     assert "model: ✓" in text
 
 
+# --- render_label_list --------------------------------------------------------
+
+
+def test_render_label_list_marks_current_and_shows_counts():
+    labels = ["coffee", "vinegar", "alcohol"]
+    counts = {"coffee": 3, "vinegar": 0}
+    text = render_label_list(labels, counts, current="vinegar")
+    lines = text.split("\n")
+    assert len(lines) == 3
+    # current row is marked, others are not.
+    current_line = next(l for l in lines if "vinegar" in l)
+    coffee_line = next(l for l in lines if "coffee" in l)
+    assert "▸" in current_line
+    assert "▸" not in coffee_line
+    # counts shown; missing label counts as 0.
+    assert "3" in coffee_line
+    assert "0" in current_line
+    alcohol_line = next(l for l in lines if "alcohol" in l)
+    assert "0" in alcohol_line
+
+
+def test_render_label_list_current_not_in_list_marks_nothing():
+    text = render_label_list(["coffee"], {}, current="zzz")
+    assert "▸" not in text
+
+
+# --- render_coach -------------------------------------------------------------
+
+
+def test_render_coach_contains_next_step_text():
+    text = render_coach(
+        "Enough data — press f to train.",
+        connected=True,
+        label="coffee",
+        reps=3,
+        classifier="knn",
+        has_model=False,
+    )
+    assert "Enough data" in text
+    assert "NEXT" in text.upper()
+
+
+def test_render_coach_header_reflects_state():
+    text = render_coach(
+        "Trained ✓ — press i to identify, m for the smell map.",
+        connected=True,
+        label="vinegar",
+        reps=2,
+        classifier="svm",
+        has_model=True,
+    )
+    assert "vinegar" in text
+    assert "svm" in text
+    assert "2" in text
+
+
 # --- widget construction (needs textual) --------------------------------------
 
 
 def test_widgets_construct():
     pytest.importorskip("textual")
-    from sniffsniff.tui.widgets import LogPanel, SensorBars, WorkflowPanel
+    from sniffsniff.tui.widgets import (
+        CoachPanel,
+        LabelList,
+        LogPanel,
+        SensorBars,
+        WorkflowPanel,
+    )
 
     SensorBars()
     WorkflowPanel()
+    LabelList()
+    CoachPanel()
     LogPanel()
 
 
